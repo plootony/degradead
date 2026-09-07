@@ -1,0 +1,51 @@
+# --- Godot 4+ ---
+# Import cache, class/extension registry. Regenerate with:
+#   godot --headless --path . --import
+.godot/
+/android/
+
+# Exported builds
+/build/
+/builds/
+/export/
+/exports/
+*.exe
+*.pck
+*.apk
+*.aab
+*.dmg
+*.app
+*.zip
+# ...but the Fusion SDK ships web export templates as .zip and is committed
+# (see the SDK note at the bottom), so keep those.
+!addons/fusion/export_templates/*.zip
+
+# Export presets can carry keystore/store passwords. The plain export_presets.cfg
+# is usually safe (and useful) to commit; these are not.
+export_presets.credentials
+*.keystore
+*.jks
+
+# --- Tooling / local state ---
+# Claude Code local runtime state (scheduled task locks etc.)
+.claude/
+.vscode/
+.idea/
+*.log
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Photon Fusion SDK ---
+# addons/fusion is COMMITTED on purpose: it is a manually downloaded preview
+# build (3.0.0-preview-555) with no package manager behind it, and the Godot
+# Asset Store only mirrors an older build (517). Pinning it keeps clones
+# reproducible -- SDK build differences already cost real debugging time.
+# It is ~102 MB, mostly platform binaries. If that becomes a problem, uncomment
+# below to drop the platforms this Windows-only prototype never uses (~60 MB),
+# and document how to re-obtain the exact SDK build:
+#addons/fusion/export_templates/
+#addons/fusion/bin/*.so
+#addons/fusion/bin/*.dylib

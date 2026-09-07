@@ -1,0 +1,42 @@
+# Normalize EOL for all files that Git considers text files.
+* text=auto eol=lf
+
+# This repo is binary-heavy (Mixamo FBX, textures, a ~102 MB GDExtension SDK).
+# `text=auto` normally detects those, but a misdetection would silently corrupt
+# them via EOL rewriting, so declare them explicitly.
+*.fbx    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.tga    binary
+*.dds    binary
+*.exr    binary
+*.hdr    binary
+*.ogg    binary
+*.wav    binary
+*.mp3    binary
+*.ttf    binary
+*.otf    binary
+*.blend  binary
+*.glb    binary
+*.res    binary
+*.scn    binary
+*.pck    binary
+*.zip    binary
+*.7z     binary
+
+# GDExtension native libraries (addons/fusion/bin)
+*.dll    binary
+*.so     binary
+*.dylib  binary
+*.wasm   binary
+*.lib    binary
+*.a      binary
+
+# Godot text resources are LF, and diffing them is genuinely useful.
+*.gd        text eol=lf diff
+*.tscn      text eol=lf diff
+*.tres      text eol=lf diff
+*.godot     text eol=lf diff
+*.import    text eol=lf diff
+*.gdextension text eol=lf diff
