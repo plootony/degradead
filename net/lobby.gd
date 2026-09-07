@@ -14,10 +14,14 @@ const PLAYER_SCENE: PackedScene = preload("res://player/player.tscn")
 var _spawner: Node
 var _players_root: Node3D
 var _spawn_points: Array[Vector3] = []
-var _next_spawn_index: int = 0
 
+var _join_panel: PanelContainer
 var _status_label: Label
 var _room_input: LineEdit
+var _hud: Control
+var _hp_label: Label
+var _weapon_label: Label
+var _stats_label: Label
 var _expecting_room: bool = false
 
 
@@ -31,6 +35,8 @@ func _ready() -> void:
 		Fusion.connection_failed.connect(_on_connection_failed)
 		Fusion.connection_status_changed.connect(_on_connection_status_changed)
 		Fusion.room_joined.connect(_on_room_joined)
+		if Fusion.has_signal("room_left"):
+			Fusion.room_left.connect(_on_room_left)
 		Fusion.player_joined.connect(_on_player_joined)
 		Fusion.player_left.connect(_on_player_left)
 		# Diagnostic dump: confirms what the native extension actually resolved
@@ -81,7 +87,8 @@ func _build_arena() -> void:
 
 	# Two spawn points far enough apart to make an "явно нецелевой выстрел" easy
 	# to set up manually while testing (aim away from the other spawn point).
-	_spawn_points = [Vector3(-4, 0, -4), Vector3(4, 0, 4)]
+	_spawn_points = [Vector3(-4, 0, -4), Vector3(4, 0, 4), Vector3(-12, 0, 8), Vector3(12, 0, -10)]
+	MatchServer.set_spawn_points(_spawn_points)
 
 
 func _add_box(size: Vector3, pos: Vector3, color: Color) -> void:
@@ -127,8 +134,7 @@ func _on_player_joined(player_id: int, player_name: String) -> void:
 	print("Fusion: player joined -> id=%d name=%s" % [player_id, player_name])
 	if not Fusion.is_master_client():
 		return  # only the simulation server spawns networked objects
-	var spawn_pos: Vector3 = _spawn_points[_next_spawn_index % _spawn_points.size()]
-	_next_spawn_index += 1
+	var spawn_pos: Vector3 = MatchServer.next_spawn_point()
 	# spawn() returns the new node directly, so configure it synchronously here.
 	# (The pre-spawn Callable parameter was tried first and never fired in this
 	# preview build -- every player ended up with input_authority 0, so their
@@ -168,12 +174,12 @@ func _build_ui() -> void:
 	var layer := CanvasLayer.new()
 	add_child(layer)
 
-	var panel := PanelContainer.new()
-	panel.set_anchors_preset(Control.PRESET_CENTER)
-	layer.add_child(panel)
+	_join_panel = PanelContainer.new()
+	_join_panel.set_anchors_preset(Control.PRESET_CENTER)
+	layer.add_child(_join_panel)
 
 	var vbox := VBoxContainer.new()
-	panel.add_child(vbox)
+	_join_panel.add_child(vbox)
 
 	_room_input = LineEdit.new()
 	_room_input.text = _initial_room_code()
@@ -188,6 +194,106 @@ func _build_ui() -> void:
 	_status_label = Label.new()
 	_status_label.text = "Not connected"
 	vbox.add_child(_status_label)
+
+	# In-game HUD: hidden until we are actually in a room (the join panel goes
+	# away at the same moment so it doesn't sit in the middle of the screen).
+	_hud = Control.new()
+	_hud.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_hud.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_hud.visible = false
+	layer.add_child(_hud)
+
+	_hp_label = Label.new()
+	_hp_label.position = Vector2(16, 12)
+	_hp_label.add_theme_font_size_override("font_size", 22)
+	_hud.add_child(_hp_label)
+
+	_weapon_label = Label.new()
+	_weapon_label.position = Vector2(16, 44)
+	_weapon_label.add_theme_font_size_override("font_size", 16)
+	_weapon_label.text = "AKS-74 [Q]   3rd person [V]"
+	_hud.add_child(_weapon_label)
+	MatchServer.local_status_changed.connect(func(text: String) -> void: _weapon_label.text = text)
+
+	var crosshair := Label.new()
+	crosshair.text = "+"
+	crosshair.add_theme_font_size_override("font_size", 28)
+	crosshair.set_anchors_preset(Control.PRESET_CENTER)
+	crosshair.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	crosshair.grow_vertical = Control.GROW_DIRECTION_BOTH
+	_hud.add_child(crosshair)
+
+	# Connection / performance stats, top-right. Always visible (also useful
+	# while connecting); refreshed on a timer, not every frame.
+	_stats_label = Label.new()
+	_stats_label.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	_stats_label.grow_horizontal = Control.GROW_DIRECTION_BEGIN
+	_stats_label.offset_right = -12
+	_stats_label.offset_top = 10
+	_stats_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	_stats_label.add_theme_font_size_override("font_size", 15)
+	_stats_label.add_theme_color_override("font_color", Color(0.9, 0.95, 1.0))
+	_stats_label.add_theme_color_override("font_shadow_color", Color(0, 0, 0, 0.8))
+	_stats_label.add_theme_constant_override("shadow_offset_x", 1)
+	_stats_label.add_theme_constant_override("shadow_offset_y", 1)
+	layer.add_child(_stats_label)
+	var stats_timer := Timer.new()
+	stats_timer.wait_time = STATS_REFRESH_SEC
+	stats_timer.autostart = true
+	stats_timer.timeout.connect(_refresh_stats)
+	add_child(stats_timer)
+	_refresh_stats()
+
+	MatchServer.local_hp_changed.connect(_on_local_hp_changed)
+	_on_local_hp_changed(NetConfig.MAX_HP)
+
+
+const STATS_REFRESH_SEC: float = 0.25
+const STATUS_NAMES: Dictionary = {
+	0: "disconnected", 1: "connecting", 2: "connected", 3: "joining room", 4: "in room", 5: "error",
+}
+
+
+func _refresh_stats() -> void:
+	var lines: Array[String] = []
+	lines.append("FPS %d  (%.1f ms)" % [Engine.get_frames_per_second(), _frame_ms])
+	lines.append("physics %d Hz" % Engine.physics_ticks_per_second)
+	if not Engine.has_singleton("Fusion"):
+		lines.append("Fusion: not loaded")
+		_stats_label.text = "\n".join(lines)
+		return
+
+	var status: int = Fusion.get_connection_status()
+	lines.append("net: %s" % STATUS_NAMES.get(status, str(status)))
+	lines.append("region %s" % Fusion.get_default_region())
+	if status >= NetConfig.CONNECTION_STATUS_CONNECTED:
+		# get_rtt() returns seconds (observed ~0.2 against the "us" region).
+		lines.append("ping %.0f ms" % (float(Fusion.get_rtt()) * 1000.0))
+	if Fusion.is_in_room():
+		var room = Fusion.get_room()
+		var room_name: String = _room_input.text
+		var count: int = 0
+		if room:
+			room_name = room.room_name
+			count = room.player_count
+		lines.append("room '%s'  players %d" % [room_name, count])
+		lines.append("me id=%d  %s" % [
+			Fusion.get_local_player_id(), "MASTER (server)" if Fusion.is_master_client() else "client"
+		])
+		lines.append("net time %.1f s" % float(Fusion.get_network_time()))
+		lines.append("spawned avatars %d" % _players_root.get_child_count())
+	_stats_label.text = "\n".join(lines)
+
+
+var _frame_ms: float = 0.0
+
+func _process(delta: float) -> void:
+	# Smoothed frame time for the stats block (FPS alone hides hitches).
+	_frame_ms = lerpf(_frame_ms, delta * 1000.0, 0.1)
+
+
+func _on_local_hp_changed(hp: int) -> void:
+	_hp_label.text = "HP %d" % hp if hp > 0 else "DEAD - respawn in %ds" % int(NetConfig.RESPAWN_DELAY_SEC)
 
 
 ## Diagnostic/testing convenience: `godot ... -- --room=SOMECODE` overrides the
@@ -237,3 +343,14 @@ func _on_room_joined() -> void:
 	_status_label.text = "In room '%s' (%d players)" % [
 		_room_input.text, Fusion.get_room().player_count if Fusion.get_room() else 1
 	]
+	print("[Lobby] %s" % _status_label.text)
+	# The connect UI has done its job: hide it so it doesn't cover the game and
+	# doesn't eat the click that captures the mouse.
+	_join_panel.visible = false
+	_hud.visible = true
+
+
+func _on_room_left() -> void:
+	_join_panel.visible = true
+	_hud.visible = false
+	_status_label.text = "Left room"

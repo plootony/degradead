@@ -1,13 +1,14 @@
 extends CharacterBody3D
 class_name Player
-## Player avatar: WASD movement + mouse look (Шаг 2), Idle/Run/Fire animation (Шаг 3),
-## Fusion client-server prediction + hitscan shooting (Шаг 4a/4b).
+## Player avatar: WASD movement + mouse look (Шаг 2), Idle/Run/Fire/Death animation
+## (Шаг 3), Fusion client-server prediction + hitscan shooting (Шаг 4a/4b).
 ##
-## The scene file (player.tscn) is intentionally a bare shell (this script + a
-## CollisionShape3D). Everything that depends on the Mixamo import's internal node
-## layout -- which we can't hand-author blind without opening the Godot editor --
-## is built at runtime in _ready() by searching the instanced model for a
-## Skeleton3D/AnimationPlayer by type, instead of hardcoding a guessed NodePath.
+## The scene file (player.tscn) is intentionally a bare shell (this script + the
+## FusionServerReplicator). Everything that depends on the Mixamo import's internal
+## node layout is built at runtime in _ready() by searching the instanced model for
+## a Skeleton3D/AnimationPlayer by type, instead of hardcoding a guessed NodePath.
+
+signal hp_changed(hp: int)
 
 const MOVE_SPEED: float = 4.5
 const GRAVITY: float = 9.8
@@ -20,6 +21,32 @@ const PITCH_MAX: float = deg_to_rad(80.0)
 ## against the actual imported Tony.fbx skeleton -- Mixamo's raw FBX uses
 ## "mixamorig:RightHand", but that colon isn't a legal Godot node-name character).
 const WEAPON_HAND_BONE: String = "mixamorig_RightHand"
+const WEAPON_BACK_BONE: String = "mixamorig_Spine2"
+const HEAD_BONE: String = "mixamorig_Head"
+const HIPS_BONE: String = "mixamorig_Hips"
+## Torso bones that get a share of the look pitch so the rifle (and the
+## first-person body) follow the vertical aim instead of staying level.
+const SPINE_PITCH_BONES: Array[String] = ["mixamorig_Spine", "mixamorig_Spine1", "mixamorig_Spine2"]
+const SPINE_PITCH_SHARE: float = 0.8  # fraction of the camera pitch that goes into the torso
+
+## Camera presets (DayZ-like): third person is over the right shoulder with the
+## character low-centre; aiming pulls in tight over the shoulder and narrows the
+## FOV; first person sits at the eyes with the body and rifle still rendered.
+enum View { THIRD_PERSON, FIRST_PERSON }
+const TPP_ARM_LENGTH: float = 3.0
+const TPP_ARM_OFFSET: Vector3 = Vector3(0.45, 0.0, 0.0)
+const TPP_FOV: float = 75.0
+const TPP_AIM_ARM_LENGTH: float = 1.3
+const TPP_AIM_ARM_OFFSET: Vector3 = Vector3(0.6, 0.1, 0.0)
+const TPP_AIM_FOV: float = 50.0
+const FPP_FOV: float = 80.0
+const FPP_AIM_FOV: float = 55.0
+## Eye point relative to the head bone, in body space (body forward is -Z).
+const FPP_EYE_OFFSET: Vector3 = Vector3(0.0, 0.08, -0.12)
+const CAMERA_BLEND_SPEED: float = 12.0
+
+enum WeaponSlot { RIFLE, HANDS }
+const WEAPON_SLOT_NAMES: Array[String] = ["AKS-74", "Hands"]
 
 ## Bone -> (hitbox key, local radius) used for the Шаг 4b modular hitboxes.
 ## Rough single-sphere-per-region approximation; adjust radii in the editor after
@@ -37,6 +64,7 @@ const HITBOX_BONES: Dictionary = {
 @export var run_forward_clip: PackedScene = preload("res://Run Forward.fbx")
 @export var run_backward_clip: PackedScene = preload("res://Run Backward.fbx")
 @export var reload_clip: PackedScene = preload("res://Reloading.fbx")
+@export var dying_clip: PackedScene = preload("res://Dying.fbx")
 
 ## Single Шаг-4a capsule (movement collider is separate; this is hitbox-layer only).
 @export var body_capsule_height: float = 1.7
@@ -49,14 +77,27 @@ var _anim_player: AnimationPlayer
 var _camera: Camera3D
 var _camera_pivot: Node3D
 var _hitbox_single: Area3D
+var _hitbox_areas: Array[Area3D] = []
 var _hitbox_history: HitboxHistory
+var _weapon_attachment: Node3D
+var _weapon_back_attachment: Node3D
+var _weapon: Node3D
+var _head_attachment: Node3D
+var _spring_arm: SpringArm3D
+var _view: View = View.THIRD_PERSON
+var _aiming: bool = false
+var _weapon_slot: int = WeaponSlot.RIFLE
 var _idle_clip_name: String = ""
 var _idle_is_static_pose: bool = false
 var _current_clip: String = ""
 
+var _hp: int = NetConfig.MAX_HP
+var _dead: bool = false
+
 ## Headless-test hook only (see `--automove` in _physics_process).
 var _automove: bool = "--automove" in OS.get_cmdline_user_args()
 var _autofire: bool = "--autofire" in OS.get_cmdline_user_args()
+var _autoaim: bool = "--autoaim" in OS.get_cmdline_user_args()
 var _autofire_accum: float = 0.0
 
 var _yaw: float = 0.0
@@ -65,9 +106,11 @@ var _prev_global_position: Vector3
 
 
 func _ready() -> void:
+	add_to_group("players")
 	_prev_global_position = global_position
 	_build_movement_collision()
 	_build_model_and_skeleton()
+	_build_spine_modifier()
 	_build_camera_rig()
 	_build_single_hitbox()
 	_build_replicator()
@@ -107,10 +150,11 @@ func _build_movement_collision() -> void:
 	col.shape = shape
 	col.position.y = 0.9
 	add_child(col)
-	# Movement collider only needs to see the environment; kept off the dedicated
-	# hitbox layer so it never interferes with shot raycasts.
-	collision_layer = 1 << 1  # "player_body" (layer 2)
-	collision_mask = 1 << 0   # "environment" (layer 1)
+	# Movement collider sees the environment AND other players' bodies (so two
+	# avatars can't walk through each other); kept off the dedicated hitbox
+	# layer so it never interferes with shot raycasts.
+	collision_layer = NetConfig.player_body_mask()
+	collision_mask = NetConfig.environment_mask() | NetConfig.player_body_mask()
 
 
 func _build_model_and_skeleton() -> void:
@@ -145,8 +189,63 @@ func _attach_weapon() -> void:
 	attachment.bone_name = WEAPON_HAND_BONE
 	_skeleton.add_child(attachment)
 	var weapon := weapon_scene.instantiate() as Node3D
+	_strip_weapon_extras(weapon)
 	_normalize_weapon_scale(weapon)
-	attachment.add_child(weapon)
+	# Orient the rifle in the hand-bone frame. Mixamo hand bones: +Y runs
+	# wrist -> knuckles, +Z is the palm normal, +X the thumb-side axis. The rifle
+	# mesh points its barrel down +X with +Y up (grip at WEAPON_GRIP_LOCAL), so
+	# barrel := along the fingers, up := thumb axis, rifle-left := into the palm.
+	_weapon = weapon
+	_weapon_attachment = attachment
+	# Holster slot: rifle slung diagonally across the back (Spine2 bone).
+	var back := BoneAttachment3D.new()
+	back.name = "WeaponBackAttachment"
+	back.bone_name = WEAPON_BACK_BONE
+	_skeleton.add_child(back)
+	_weapon_back_attachment = back
+	_apply_weapon_slot()
+
+
+## Places the rifle on the hand or the back according to _weapon_slot.
+func _apply_weapon_slot() -> void:
+	if not _weapon:
+		return
+	var s: float = _weapon.scale.x  # uniform, set by _normalize_weapon_scale
+	var target: Node3D = _weapon_attachment if _weapon_slot == WeaponSlot.RIFLE else _weapon_back_attachment
+	if _weapon.get_parent() != target:
+		if _weapon.get_parent():
+			_weapon.get_parent().remove_child(_weapon)
+		target.add_child(_weapon)
+	if _weapon_slot == WeaponSlot.RIFLE:
+		_weapon.basis = WEAPON_IN_HAND_BASIS * s
+		_weapon.position = -(WEAPON_IN_HAND_BASIS * (WEAPON_GRIP_LOCAL * s)) + WEAPON_PALM_OFFSET
+	else:
+		_weapon.basis = WEAPON_ON_BACK_BASIS * s
+		_weapon.position = WEAPON_ON_BACK_OFFSET
+
+
+## Extra props that ship inside aks-74.fbx lying next to the rifle (a loose
+## cartridge, its empty case and a spare magazine). They are not part of the
+## weapon; the inserted "ak74 30rnd bakelite mag" stays.
+const WEAPON_EXTRA_NODE_NAMES: Array[String] = ["54539", "54539 case", "ak74 30rnd empty bakelite mag"]
+## Rifle-local (unscaled) point in the middle of the pistol grip.
+const WEAPON_GRIP_LOCAL: Vector3 = Vector3(-0.93, -1.0, 0.0)
+## Rifle axes expressed in hand-bone space: rifle +X (barrel) -> bone +Y,
+## rifle +Y (up) -> bone +X, rifle +Z (right side) -> bone -Z.
+const WEAPON_IN_HAND_BASIS: Basis = Basis(Vector3(0, 1, 0), Vector3(1, 0, 0), Vector3(0, 0, -1))
+## Bone-space nudge so the grip sits inside the closed fist rather than at the wrist.
+const WEAPON_PALM_OFFSET: Vector3 = Vector3(0.0, 0.08, 0.03)
+## Holstered pose in the Spine2 bone frame (+Y up the spine, +Z model-forward,
+## i.e. out of the chest): barrel up-and-left across the back, behind the body.
+## Rifle top faces the body (+Z) so the magazine sticks outward, not into the back.
+const WEAPON_ON_BACK_BASIS: Basis = Basis(Vector3(0.454, 0.891, 0.0), Vector3(0.0, 0.0, 1.0), Vector3(0.891, -0.454, 0.0))
+const WEAPON_ON_BACK_OFFSET: Vector3 = Vector3(0.0, 0.0, -0.2)
+
+func _strip_weapon_extras(weapon: Node) -> void:
+	for child in weapon.get_children():
+		if String(child.name) in WEAPON_EXTRA_NODE_NAMES:
+			weapon.remove_child(child)
+			child.queue_free()
 
 
 ## aks-74.fbx renders many meters long at scale 1.0 -- almost certainly a
@@ -196,15 +295,100 @@ func _build_camera_rig() -> void:
 	_camera_pivot.position.y = 1.6
 	add_child(_camera_pivot)
 
-	var arm := SpringArm3D.new()
-	arm.name = "SpringArm"
-	arm.spring_length = 4.0
-	arm.add_excluded_object(get_rid())
-	_camera_pivot.add_child(arm)
+	_spring_arm = SpringArm3D.new()
+	_spring_arm.name = "SpringArm"
+	_spring_arm.spring_length = TPP_ARM_LENGTH
+	_spring_arm.position = TPP_ARM_OFFSET
+	_spring_arm.margin = 0.15
+	_spring_arm.collision_mask = NetConfig.environment_mask()
+	_spring_arm.add_excluded_object(get_rid())
+	_camera_pivot.add_child(_spring_arm)
 
 	_camera = Camera3D.new()
 	_camera.name = "Camera3D"
-	arm.add_child(_camera)
+	_camera.fov = TPP_FOV
+	_camera.near = 0.03
+	_spring_arm.add_child(_camera)
+
+	# Eye anchor for first person: follows the animated head (natural bob).
+	if _skeleton and _skeleton.find_bone(HEAD_BONE) != -1:
+		_head_attachment = BoneAttachment3D.new()
+		_head_attachment.name = "HeadAttachment"
+		_head_attachment.bone_name = HEAD_BONE
+		_skeleton.add_child(_head_attachment)
+
+
+## Per-frame camera rig blend towards the preset for (view, aiming).
+func _update_camera(delta: float) -> void:
+	if not _camera or not _spring_arm:
+		return
+	var target_len: float
+	var target_offset: Vector3
+	var target_fov: float
+	var target_pivot: Vector3 = Vector3(0.0, 1.6, 0.0)
+	var k := clampf(delta * CAMERA_BLEND_SPEED, 0.0, 1.0)
+	if _view == View.FIRST_PERSON:
+		target_len = 0.0
+		target_offset = Vector3.ZERO
+		target_fov = FPP_AIM_FOV if _aiming else FPP_FOV
+		if _head_attachment:
+			target_pivot = to_local(_head_attachment.global_position) + FPP_EYE_OFFSET
+			k = 1.0  # track the head exactly, no lag
+	elif _aiming:
+		target_len = TPP_AIM_ARM_LENGTH
+		target_offset = TPP_AIM_ARM_OFFSET
+		target_fov = TPP_AIM_FOV
+	else:
+		target_len = TPP_ARM_LENGTH
+		target_offset = TPP_ARM_OFFSET
+		target_fov = TPP_FOV
+	var kk := clampf(delta * CAMERA_BLEND_SPEED, 0.0, 1.0)
+	_spring_arm.spring_length = lerpf(_spring_arm.spring_length, target_len, kk)
+	_spring_arm.position = _spring_arm.position.lerp(target_offset, kk)
+	_camera.fov = lerpf(_camera.fov, target_fov, kk)
+	_camera_pivot.position = _camera_pivot.position.lerp(target_pivot, k)
+
+
+## Bends the torso with the look pitch. Implemented as a SkeletonModifier3D
+## (child of the Skeleton3D) because the skeleton applies modifiers on top of
+## the animation pose non-destructively every frame. Writing bone poses from
+## _process instead accumulated the rotation whenever the AnimationPlayer was
+## paused (the idle pose), folding the character in half within a second.
+class SpinePitchModifier extends SkeletonModifier3D:
+	var pitch: float = 0.0
+	var bone_indices: Array[int] = []
+
+	func _process_modification_with_delta(_delta: float) -> void:
+		var skeleton := get_skeleton()
+		if not skeleton or bone_indices.is_empty():
+			return
+		var share := pitch * SPINE_PITCH_SHARE / bone_indices.size()
+		# Bone-local +X is the character's left-right axis; the sign was picked
+		# from screenshots (look down = torso leans forward).
+		var extra := Quaternion(Vector3.RIGHT, -share)
+		for idx in bone_indices:
+			skeleton.set_bone_pose_rotation(idx, skeleton.get_bone_pose_rotation(idx) * extra)
+
+
+var _spine_modifier: SpinePitchModifier
+
+
+func _build_spine_modifier() -> void:
+	if not _skeleton:
+		return
+	_spine_modifier = SpinePitchModifier.new()
+	_spine_modifier.name = "SpinePitch"
+	for bone_name in SPINE_PITCH_BONES:
+		var idx := _skeleton.find_bone(bone_name)
+		if idx != -1:
+			_spine_modifier.bone_indices.append(idx)
+	_skeleton.add_child(_spine_modifier)
+
+
+func _process(delta: float) -> void:
+	_update_camera(delta)
+	if _spine_modifier:
+		_spine_modifier.pitch = 0.0 if _dead else _pitch
 
 
 func _build_single_hitbox() -> void:
@@ -215,6 +399,7 @@ func _build_single_hitbox() -> void:
 	_hitbox_single.monitorable = true
 	_hitbox_single.monitoring = false
 	_hitbox_single.set_meta("player", self)
+	_hitbox_single.set_meta("hitbox_key", "body")
 	var shape := CapsuleShape3D.new()
 	shape.height = body_capsule_height
 	shape.radius = body_capsule_radius
@@ -223,6 +408,7 @@ func _build_single_hitbox() -> void:
 	col.position.y = body_capsule_center_y
 	_hitbox_single.add_child(col)
 	add_child(_hitbox_single)
+	_hitbox_areas.append(_hitbox_single)
 
 
 func _build_modular_hitboxes() -> void:
@@ -237,9 +423,12 @@ func _build_modular_hitboxes() -> void:
 		attachment.bone_name = bone_name
 		_skeleton.add_child(attachment)
 		var area := Area3D.new()
-		area.collision_layer = NetConfig.hitbox_mask()
+		# Per-bone areas are only sampled into HitboxHistory (modular mode); they
+		# stay off the hitbox layer so the single-mode raycast never sees them.
+		area.collision_layer = 0
 		area.collision_mask = 0
 		area.monitoring = false
+		area.monitorable = false
 		area.set_meta("player", self)
 		area.set_meta("hitbox_key", info["key"])
 		var shape := SphereShape3D.new()
@@ -268,12 +457,13 @@ func _merge_animation_clips() -> void:
 	if not lib:
 		lib = AnimationLibrary.new()
 		_anim_player.add_animation_library("", lib)
-	_merge_clip_into(lib, run_forward_clip, "run_forward")
-	_merge_clip_into(lib, run_backward_clip, "run_backward")
-	_merge_clip_into(lib, reload_clip, "reload")
+	_merge_clip_into(lib, run_forward_clip, "run_forward", true)
+	_merge_clip_into(lib, run_backward_clip, "run_backward", true)
+	_merge_clip_into(lib, reload_clip, "reload", false)
+	_merge_clip_into(lib, dying_clip, "dying", false)
 
 
-func _merge_clip_into(target_lib: AnimationLibrary, scene: PackedScene, new_name: String) -> void:
+func _merge_clip_into(target_lib: AnimationLibrary, scene: PackedScene, new_name: String, looping: bool) -> void:
 	if target_lib.has_animation(new_name) or not scene:
 		return
 	var temp := scene.instantiate()
@@ -282,11 +472,38 @@ func _merge_clip_into(target_lib: AnimationLibrary, scene: PackedScene, new_name
 		for lib_name in src_player.get_animation_library_list():
 			var src_lib := src_player.get_animation_library(lib_name)
 			for anim_name in src_lib.get_animation_list():
-				target_lib.add_animation(new_name, src_lib.get_animation(anim_name))
+				# Duplicate: the imported resource is shared between all Player
+				# instances and we are about to edit its tracks.
+				var anim: Animation = src_lib.get_animation(anim_name).duplicate()
+				# Mixamo exports come in with loop_mode = NONE, so a run cycle
+				# played once (0.5 s) and then froze mid-stride.
+				anim.loop_mode = Animation.LOOP_LINEAR if looping else Animation.LOOP_NONE
+				if looping:
+					_bake_in_place(anim)
+				target_lib.add_animation(new_name, anim)
 				break  # each Mixamo "without skin" export has exactly one clip
 			if target_lib.has_animation(new_name):
 				break
 	temp.free()
+
+
+## Strips horizontal root motion from the hips position track. "Run Backward"
+## was exported WITHOUT "In Place": its hips travel ~2.5 m per cycle, which
+## dragged the mesh away from the collider/camera and snapped it back every
+## loop -- the visible "camera breaks while running" bug.
+func _bake_in_place(anim: Animation) -> void:
+	for t in range(anim.get_track_count()):
+		if anim.track_get_type(t) != Animation.TYPE_POSITION_3D:
+			continue
+		if not String(anim.track_get_path(t)).ends_with(HIPS_BONE):
+			continue
+		var key_count := anim.track_get_key_count(t)
+		if key_count == 0:
+			continue
+		var first: Vector3 = anim.track_get_key_value(t, 0)
+		for k in range(key_count):
+			var v: Vector3 = anim.track_get_key_value(t, k)
+			anim.track_set_key_value(t, k, Vector3(first.x, v.y, first.z))
 
 
 static func _find_child_of_type(root: Node, type) -> Node:
@@ -316,6 +533,49 @@ func _unhandled_input(event: InputEvent) -> void:
 		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	elif event.is_action_pressed("ui_cancel"):
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	elif event.is_action_pressed("toggle_view"):
+		set_view(View.FIRST_PERSON if _view == View.THIRD_PERSON else View.THIRD_PERSON)
+	elif event.is_action_pressed("switch_weapon"):
+		_request_weapon_slot((_weapon_slot + 1) % WeaponSlot.size())
+	elif event.is_action_pressed("weapon_slot_1"):
+		_request_weapon_slot(WeaponSlot.RIFLE)
+	elif event.is_action_pressed("weapon_slot_2"):
+		_request_weapon_slot(WeaponSlot.HANDS)
+
+
+func set_view(view: View) -> void:
+	_view = view
+	_emit_local_status()
+
+
+func set_aiming(aiming: bool) -> void:
+	if aiming == _aiming:
+		return
+	_aiming = aiming
+	_emit_local_status()
+
+
+## Local input -> broadcast so every peer re-parents the rifle the same way.
+func _request_weapon_slot(slot: int) -> void:
+	if slot == _weapon_slot or _dead:
+		return
+	Fusion.rpc(rpc_set_weapon_slot, slot)
+
+
+@rpc("any_peer", "call_local")
+func rpc_set_weapon_slot(slot: int) -> void:
+	_weapon_slot = slot
+	_apply_weapon_slot()
+	_emit_local_status()
+
+
+func _emit_local_status() -> void:
+	if MatchServer and _has_input_authority():
+		MatchServer.local_status_changed.emit("%s [Q]   %s [V]%s" % [
+			WEAPON_SLOT_NAMES[_weapon_slot],
+			"1st person" if _view == View.FIRST_PERSON else "3rd person",
+			"   AIM" if _aiming else "",
+		])
 
 
 func _physics_process(delta: float) -> void:
@@ -335,7 +595,13 @@ func _physics_process(delta: float) -> void:
 			# so movement/replication can be verified without a human at the
 			# keyboard. Never active in a normal run.
 			move_input = Vector2(0.0, -1.0)
-		var fire_pressed := Input.is_action_just_pressed("fire")
+		if _autoaim:
+			# Headless test hook (`-- --autoaim`): face the nearest other player
+			# so `--autofire` shots actually exercise the hit/death/respawn path.
+			_aim_at_nearest_player()
+		var mouse_captured := Input.mouse_mode == Input.MOUSE_MODE_CAPTURED
+		set_aiming(mouse_captured and Input.is_action_pressed("aim"))
+		var fire_pressed := Input.is_action_just_pressed("fire") and mouse_captured and _weapon_slot == WeaponSlot.RIFLE
 		if _autofire:
 			# Headless test hook (`-- --autofire`): pull the trigger on a timer
 			# so the shot RPC -> server raycast -> broadcast path can be checked.
@@ -343,6 +609,9 @@ func _physics_process(delta: float) -> void:
 			if _autofire_accum >= 2.0:
 				_autofire_accum = 0.0
 				fire_pressed = true
+		if _dead:
+			move_input = Vector2.ZERO
+			fire_pressed = false
 		var payload := {
 			"move": move_input,
 			"yaw": _yaw,
@@ -384,11 +653,35 @@ func _has_input_authority() -> bool:
 	return _replicator != null and bool(_replicator.call("has_input_authority"))
 
 
+func _aim_at_nearest_player() -> void:
+	var best: Node3D = null
+	var best_dist := INF
+	for other in get_tree().get_nodes_in_group("players"):
+		if other == self or not other is Node3D:
+			continue
+		var d: float = global_position.distance_to(other.global_position)
+		if d < best_dist:
+			best_dist = d
+			best = other
+	if not best:
+		return
+	var to := best.global_position - global_position
+	# Shots leave the camera, which sits to the right of the body by the spring
+	# arm offset: yaw the body left by the angle that offset subtends so the
+	# camera ray (not the body's forward line) passes through the target.
+	var lateral: float = _spring_arm.position.x if _spring_arm else 0.0
+	var dist := Vector2(to.x, to.z).length()
+	_yaw = atan2(-to.x, -to.z) + (asin(clampf(lateral / dist, -1.0, 1.0)) if dist > 0.01 else 0.0)
+	_pitch = 0.0
+
+
 func _update_animation(delta: float) -> void:
 	if delta <= 0.0:
 		return
 	var apparent_velocity := (global_position - _prev_global_position) / delta
 	_prev_global_position = global_position
+	if _dead or not _anim_player:
+		return  # the death clip owns the skeleton until respawn
 	var horizontal := Vector2(apparent_velocity.x, apparent_velocity.z)
 	var speed := horizontal.length()
 
@@ -398,13 +691,20 @@ func _update_animation(delta: float) -> void:
 	var state := "idle"
 	if speed > 0.35:
 		var forward := -transform.basis.z
-		var moving_forward := Vector2(forward.x, forward.z).dot(horizontal) >= 0.0
-		state = "run_forward" if moving_forward else "run_backward"
+		var along := Vector2(forward.x, forward.z).dot(horizontal) / speed  # -1..1
+		# Only two locomotion clips exist, so strafing has to pick one. Pure
+		# sideways motion has `along` ~ 0 and a plain sign test flipped between
+		# forward/backward every physics tick (each flip restarts the clip).
+		# Stick with the current clip inside a wide dead band instead.
+		if _current_clip == "run_backward":
+			state = "run_backward" if along < 0.35 else "run_forward"
+		else:
+			state = "run_backward" if along < -0.35 else "run_forward"
 
-	if state == _current_clip or not _anim_player:
+	if state == _current_clip:
 		return
-	# Don't cut a fire/reload one-shot short while it is still playing.
-	if _current_clip == "reload" and _anim_player.is_playing():
+	# Don't cut the fire one-shot short while standing still; movement wins.
+	if _current_clip == "reload" and _anim_player.is_playing() and state == "idle":
 		return
 
 	if state == "idle":
@@ -421,6 +721,8 @@ func _update_animation(delta: float) -> void:
 
 
 func _play_fire_clip() -> void:
+	if _dead:
+		return
 	if _anim_player and _anim_player.has_animation("reload"):
 		_anim_player.play("reload")
 		_current_clip = "reload"
@@ -444,7 +746,7 @@ func _on_process_input(_tick: int, delta_time: float, payload: PackedByteArray, 
 	rotation.y = _yaw
 	if _camera_pivot:
 		_camera_pivot.rotation.x = _pitch
-	_apply_movement(input.get("move", Vector2.ZERO), delta_time)
+	_apply_movement(Vector2.ZERO if _dead else input.get("move", Vector2.ZERO), delta_time)
 
 	# Only the visual here: the shot RPC itself is sent from the input sampling
 	# path in _physics_process, because this callback does not run at all on a
@@ -491,14 +793,96 @@ func rpc_request_fire(claimed_shooter_id: int, origin: Vector3, direction: Vecto
 	var shooter_id: int = Fusion.get_rpc_sender()
 	if shooter_id <= 0:
 		shooter_id = claimed_shooter_id
-	var result: Dictionary = await MatchServer.resolve_shot(shooter_id, origin, direction)
-	Fusion.rpc(rpc_report_hit, shooter_id, result["target_id"], result["hit_bone"], result["position"])
+	var shooter := MatchServer.get_player(shooter_id)
+	if shooter and (shooter.call("is_dead") or shooter.call("get_weapon_slot") != WeaponSlot.RIFLE):
+		return
+	var result: Dictionary = MatchServer.resolve_shot(shooter_id, origin, direction)
+	Fusion.rpc(rpc_report_hit, shooter_id, result["target_id"], result["hit_bone"], result["position"], result["hp_left"])
 
 
 ## RPC entry point, broadcast to every peer so both clients show the same result.
 @rpc("any_peer", "call_local")
-func rpc_report_hit(shooter_id: int, target_id: int, hit_bone: String, position: Vector3) -> void:
-	MatchServer.report_hit(shooter_id, target_id, hit_bone, position)
+func rpc_report_hit(shooter_id: int, target_id: int, hit_bone: String, position: Vector3, hp_left: int) -> void:
+	MatchServer.report_hit(shooter_id, target_id, hit_bone, position, hp_left)
+
+
+## Master -> everyone: this player comes back to life at spawn_pos.
+func broadcast_respawn(spawn_pos: Vector3) -> void:
+	Fusion.rpc(rpc_respawn, spawn_pos)
+
+
+@rpc("any_peer", "call_local")
+func rpc_respawn(spawn_pos: Vector3) -> void:
+	_dead = false
+	_hp = NetConfig.MAX_HP
+	velocity = Vector3.ZERO
+	global_position = spawn_pos
+	_prev_global_position = spawn_pos
+	_set_hitboxes_enabled(true)
+	# Snap remote copies instead of lerping across the map. The SDK only accepts
+	# teleport() from the authority peer (logs an error elsewhere), so gate it.
+	if _replicator and _replicator.has_method("teleport") and bool(_replicator.call("has_authority")):
+		_replicator.call("teleport")
+	_current_clip = ""
+	if _anim_player:
+		_anim_player.stop()
+	_emit_hp()
+
+
+# ---------------------------------------------------------------------------
+# Health / death (mirrored on every peer from the master's hit report).
+# ---------------------------------------------------------------------------
+
+func apply_hit_result(hp_left: int, _position: Vector3) -> void:
+	_hp = hp_left
+	_emit_hp()
+	if hp_left <= 0 and not _dead:
+		_die()
+
+
+func _die() -> void:
+	_dead = true
+	velocity = Vector3.ZERO
+	_set_hitboxes_enabled(false)
+	if _anim_player and _anim_player.has_animation("dying"):
+		_anim_player.play("dying")  # LOOP_NONE: holds the final pose until respawn
+		_current_clip = "dying"
+
+
+func _set_hitboxes_enabled(enabled: bool) -> void:
+	for area in _hitbox_areas:
+		area.collision_layer = NetConfig.hitbox_mask() if enabled else 0
+
+
+func _emit_hp() -> void:
+	hp_changed.emit(_hp)
+	if MatchServer and _has_input_authority():
+		MatchServer.local_hp_changed.emit(_hp)
+
+
+# ---------------------------------------------------------------------------
+# Visual feedback.
+# ---------------------------------------------------------------------------
+
+## Short-lived line from the muzzle to the impact point, drawn on every peer.
+func show_tracer(to: Vector3) -> void:
+	var from: Vector3 = _weapon_attachment.global_position if _weapon_attachment else global_position + Vector3(0, 1.4, 0)
+	var mesh := ImmediateMesh.new()
+	mesh.surface_begin(Mesh.PRIMITIVE_LINES)
+	mesh.surface_add_vertex(from)
+	mesh.surface_add_vertex(to)
+	mesh.surface_end()
+	var inst := MeshInstance3D.new()
+	inst.mesh = mesh
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.albedo_color = Color(1.0, 0.85, 0.4)
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	inst.material_override = mat
+	get_tree().current_scene.add_child(inst)
+	var tween := inst.create_tween()
+	tween.tween_property(mat, "albedo_color:a", 0.0, 0.15)
+	tween.tween_callback(inst.queue_free)
 
 
 # ---------------------------------------------------------------------------
@@ -513,9 +897,30 @@ func get_player_id() -> int:
 	return _replicator.call("get_input_authority") if _replicator else -1
 
 
+func get_hp() -> int:
+	return _hp
+
+
+func is_dead() -> bool:
+	return _dead
+
+
+func get_weapon_slot() -> int:
+	return _weapon_slot
+
+
 func get_hitbox_history() -> HitboxHistory:
 	return _hitbox_history
 
 
 func get_single_hitbox_node() -> Area3D:
 	return _hitbox_single
+
+
+## RIDs of this player's own colliders, so a third-person shot fired from behind
+## the character's head doesn't stop on the shooter's own capsule.
+func get_hitbox_rids() -> Array[RID]:
+	var rids: Array[RID] = [get_rid()]
+	for area in _hitbox_areas:
+		rids.append(area.get_rid())
+	return rids

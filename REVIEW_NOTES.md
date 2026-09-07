@@ -14,7 +14,7 @@ Throwaway prototype validating one hypothesis: **Godot 4.7.2 + Photon Fusion (Go
 | `player/player.gd` / `.tscn` | Avatar: movement, camera, animation, hitboxes, shot RPC endpoints |
 | `net/match_server.gd` | Autoload: player registry + shot resolution (4a raycast, 4b rewind) |
 | `net/hitbox_history.gd` | Per-player position history buffer for lag compensation |
-| `autoload/net_config.gd` | Shared constants: artificial delay, layer masks, raw Fusion enum ints |
+| `autoload/net_config.gd` | Shared constants: layer masks, hp/damage/respawn, raw Fusion enum ints |
 
 ## Fusion preview-SDK gotchas — these look like bugs but are deliberate
 Every one of these was found empirically (the official docs are behind a bot-wall; the C# wrappers in `addons/fusion/cs/**` are the de-facto API reference). **Do not "simplify" these away.**
@@ -33,15 +33,21 @@ Every one of these was found empirically (the official docs are behind a bot-wal
 ## Asset gotchas
 - Godot's importer rewrites `mixamorig:Head` → `mixamorig_Head` (colon is illegal in node names).
 - `Tony.fbx`'s own clip imports as `mixamo_com` and **is the T-pose** — must not be used as idle.
-- `aks-74.fbx` is ~10× oversized (9.2 m); `_normalize_weapon_scale()` measures its AABB and rescales to 0.9 m.
+- `aks-74.fbx` is ~10× oversized (9.2 m); `_normalize_weapon_scale()` measures its AABB and rescales to 0.9 m. The file also contains loose props next to the rifle (a cartridge `54539`, its case, and a spare empty magazine) — `Player._strip_weapon_extras()` drops them by node name. Barrel is +X, up is +Y, grip around (-0.93, -1.0, 0) in rifle units; `WEAPON_IN_HAND_BASIS` / `WEAPON_PALM_OFFSET` map that into the Mixamo right-hand bone frame (+Y wrist→knuckles, +Z palm normal).
 - Mixamo models face **+Z**; the visual container is rotated 180° so the character doesn't run backwards.
 
 ## Where to focus review
-- **Deviation from spec:** the artificial 100–150 ms delay is applied only in `MatchServer.resolve_shot()`, *not* to input processing — the SDK owns the input queue. This weakens the "test under real latency" claim for movement.
-- **Lag compensation (4b)** uses sphere-vs-ray against a fixed rewind window equal to the artificial delay, not per-player RTT, and approximates every bone as a sphere. Unverified.
+- **Artificial delay removed** (was 125 ms in `MatchServer.resolve_shot()` only). Shots resolve synchronously on the master; latency is whatever Photon gives you.
+- **Lag compensation (4b)** uses sphere-vs-ray, rewinding by `Fusion.get_rtt()` (seconds, observed ~0.2 to the "us" region) clamped to `HITBOX_HISTORY_SEC`, and approximates every bone as a sphere. Level geometry occludes. Unverified end to end.
+- **Health/death** is master-authoritative (`MatchServer._hp`); every peer mirrors hp from the broadcast hit report and plays `dying` locally. Respawn is a master timer → `Player.broadcast_respawn()` → `rpc_respawn` on all peers (sets position + `teleport()` on the replicator, best effort).
+- **Animation clips are patched at merge time**: Mixamo exports have `loop_mode = NONE` (run cycles froze after 0.5 s) and `Run Backward` was exported without "In Place" (hips travel ~2.5 m per cycle — the mesh flew away from the collider/camera). `Player._bake_in_place()` strips horizontal hips translation from the run clips. Strafing uses a ±0.35 dead band with hysteresis so the forward/backward choice doesn't flip every tick.
 - **Idle animation** is `run_forward` frozen at frame 0 — no idle clip exists in the asset set. Looks like a mid-stride freeze.
+- **Camera rig**: one `CameraPivot → SpringArm3D → Camera3D` chain blended per frame between presets (`TPP_*`, `TPP_AIM_*`, `FPP_*` constants in `player.gd`). First person parks the pivot on a `BoneAttachment3D` at `mixamorig_Head` plus `FPP_EYE_OFFSET`, `near = 0.03`; the head mesh ends up behind the near plane so nothing is hidden.
+- **Torso pitch** is a `SkeletonModifier3D` child of the skeleton (`Player.SpinePitchModifier`), NOT a `set_bone_pose_rotation` from `_process`: the latter accumulated every frame while the AnimationPlayer was paused (idle pose) and folded the character in half. Only peers that receive the player's input (owner + master) know `_pitch`; plain observers see a level torso.
+- **Weapon slots** are broadcast via `rpc_set_weapon_slot` (call_local) and re-parent the same rifle node between the hand and `mixamorig_Spine2` attachments. Late joiners don't get the current slot (same limitation as the dead state).
+- **Self-hit exclusion**: the third-person ray starts behind the shooter's head, so the shooter's own capsule is excluded from the query (previously that counted as a miss).
 - `MatchServer.register_player()` is retried from `_on_process_input` because `input_authority` may not be set at `_ready()` time. Slightly hacky; worth confirming ordering guarantees.
-- Test hooks `--automove`, `--autofire`, `--posdump`, `--room=` live in production code (opt-in via CLI args only).
+- Test hooks `--automove`, `--autofire`, `--autoaim`, `--posdump`, `--room=` live in production code (opt-in via CLI args only). `--autoaim` faces the nearest other player so `--autofire` exercises hit → death → respawn.
 - `Player._local_aabb()` composes local transforms manually — check the maths if the weapon scale ever looks off.
 - `player.tscn` is intentionally a bare shell; almost the whole node tree is built at runtime in `_ready()` because the FBX import layout could not be inspected when it was written. Reasonable to revisit now that the editor is available.
 
