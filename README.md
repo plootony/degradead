@@ -25,7 +25,7 @@ The Fusion addon is a plain GDExtension: it loads automatically from `addons/fus
 
 In the editor: **Debug → Run Multiple Instances → 2 Instances**, then `F5`. Press **Join** in both windows with the same room code.
 
-Controls: `WASD` move, mouse look, **click** to capture the mouse, **Esc** to release it (needed to click into the other window), **LMB** to fire (only while the mouse is captured and the rifle is in hand), **RMB (hold)** aim, **V** toggle first / third person, **Q** switch weapon (rifle ⇄ hands, the rifle goes on the back), **1** / **2** pick the slot directly.
+Controls: `WASD` move, mouse look, **click** to capture the mouse, **Esc** to release it (needed to click into the other window), **LMB** to fire (only while the mouse is captured and the rifle is in hand), **RMB (hold)** aim, **Shift (hold)** sprint, **Space** jump, **C** toggle crouch, **Z** toggle prone (from either stand or crouch; pressing it again while prone stands back up), **F** melee (rifle butt, visual only -- no damage), **V** toggle first / third person, **Q** switch weapon (rifle ⇄ hands, the rifle goes on the back), **1** / **2** pick the slot directly.
 
 Camera is DayZ-like: third person sits behind and over the right shoulder with the character low-centre; aiming pulls in tight over the shoulder and narrows the FOV; first person is at the eyes with the body and rifle rendered. The torso bends with the vertical look angle (a `SkeletonModifier3D` on top of the animation), so the rifle follows your aim in every view.
 

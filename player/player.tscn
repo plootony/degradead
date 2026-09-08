@@ -10,3 +10,4 @@ root_path = NodePath("..")
 owner_mode = 5
 root_replication_mode = 1
 root_interpolation_mode = 1
+root_teleport_threshold = 2.5

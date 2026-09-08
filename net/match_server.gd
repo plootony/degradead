@@ -130,7 +130,7 @@ func report_hit(shooter_id: int, target_id: int, hit_bone: String, position: Vec
 		_spawn_impact(position, Color(0.8, 0.05, 0.05), 24)
 		var target := get_player(target_id)
 		if target:
-			target.call("apply_hit_result", hp_left, position)
+			target.call("apply_hit_result", hp_left, position, hit_bone)
 	elif hit_bone == HIT_WORLD:
 		_spawn_impact(position, Color(0.85, 0.8, 0.6), 12)
 

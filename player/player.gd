@@ -16,6 +16,33 @@ const MOUSE_SENSITIVITY: float = 0.0035
 const PITCH_MIN: float = deg_to_rad(-80.0)
 const PITCH_MAX: float = deg_to_rad(80.0)
 
+## For a peer that neither owns a given Player nor is master for it, that node's
+## global_position only moves on the physics ticks a Fusion network snapshot
+## actually lands on -- every tick in between reads as zero apparent velocity
+## even mid-stride. Without this grace window, _update_animation() flickered
+## straight back to the frozen idle pose on every such tick, which is what
+## looked like "no animation, just sliding" with a hard snap on the tick a
+## snapshot did land. Locally-simulated players (owner, or master-simulated
+## remotes) update every tick anyway, so this adds no perceptible lag there.
+const ANIM_STOP_GRACE_SEC: float = 0.2
+
+## Extra margin the OTHER axis must clear before axis-dominance flips between
+## forward/backward and left/right in _update_animation(). Holding an exact
+## diagonal (e.g. W+A) puts abs(along) ~= abs(lateral), and without this
+## margin floating-point noise flipped the dominant axis every physics tick --
+## each flip restarts the clip via play(), which looked like the animation
+## stuttering/lagging specifically while moving diagonally.
+const DIAGONAL_AXIS_HYSTERESIS: float = 0.2
+
+## Non-lethal hit feedback: a quick procedural jerk instead of a clip --
+## "Hit Reaction.fbx" turned out to be a crouch, not a flinch (see
+## REVIEW_NOTES.md). Rotates the whole skeleton node by a small random amount
+## and springs it back via a Tween; layered on top of whatever locomotion/aim
+## animation is already driving the bone poses rather than interrupting it,
+## so it works regardless of what _current_clip is at the moment of the hit.
+const HIT_JERK_ROTATION: float = deg_to_rad(12.0)
+const HIT_JERK_RECOVER_SEC: float = 0.12
+
 ## Bone the weapon is rigidly attached to (no IK, per ТЗ scope -- visual mismatch
 ## expected). Godot's importer replaces ":" with "_" in bone names (confirmed
 ## against the actual imported Tony.fbx skeleton -- Mixamo's raw FBX uses
@@ -48,6 +75,88 @@ const CAMERA_BLEND_SPEED: float = 12.0
 enum WeaponSlot { RIFLE, HANDS }
 const WEAPON_SLOT_NAMES: Array[String] = ["AKS-74", "Hands"]
 
+## Stance system. Values double as STANCE_TRANSITION_CLIP key digits below, so
+## don't reorder without updating that table.
+enum Stance { STAND, CROUCH, PRONE }
+const CROUCH_SPEED: float = 3.0
+const PRONE_SPEED: float = 1.1
+const SPRINT_SPEED: float = 6.5
+## Playback rate for the stand<->crouch transition clip (both directions --
+## see rpc_set_stance()/_play_action_reversed()). >1 = faster than the
+## recorded motion; the default 1x looked sluggish.
+const CROUCH_TRANSITION_SPEED_SCALE: float = 1.6
+## Forward-pace clip is picked from *observed* speed (see _forward_pace_clip()),
+## not an input flag -- keeps it correct for a peer that only ever sees this
+## Player's replicated position (same reasoning as ANIM_STOP_GRACE_SEC above).
+const RUN_ANIM_SPEED_MIN: float = 3.0
+const SPRINT_ANIM_SPEED_MIN: float = 5.5
+
+const JUMP_VELOCITY: float = 4.6
+
+## Procedural "knees up" jump pose instead of a clip -- see LegTuckModifier
+## near _build_spine_modifier(). The downloaded Jump/Running Jump/Falling
+## Idle/Landing/Hard Landing set turned out to be built for falling from a
+## big height (see REVIEW_NOTES.md), wrong for this game's small hop, and hit
+## a double-fire bug on top of that (vertical speed crossing zero at the apex
+## looked like a landing). A continuous procedural blend sidesteps both: no
+## discrete clip state to mis-trigger, and no asset to be the wrong one.
+const JUMP_TUCK_AIR_THRESHOLD: float = 0.6  # vertical apparent-speed, m/s
+const JUMP_TUCK_BLEND_SPEED: float = 6.0  # tuck units/sec (move_toward)
+const JUMP_TUCK_THIGH_ANGLE: float = deg_to_rad(45.0)
+const JUMP_TUCK_SHIN_ANGLE: float = deg_to_rad(70.0)
+const LEG_TUCK_THIGH_BONES: Array[String] = ["mixamorig_LeftUpLeg", "mixamorig_RightUpLeg"]
+const LEG_TUCK_SHIN_BONES: Array[String] = ["mixamorig_LeftLeg", "mixamorig_RightLeg"]
+
+## Movement collider per stance: (height, radius, center_y), same CapsuleShape3D
+## node resized on stance change -- see _apply_stance_collision(). Rough numbers,
+## no real crouch/prone silhouette reference; same class of approximation as
+## HITBOX_BONES below.
+const STANCE_COLLISION: Dictionary = {
+	Stance.STAND: {"height": 1.8, "radius": 0.35, "center_y": 0.9},
+	Stance.CROUCH: {"height": 1.1, "radius": 0.35, "center_y": 0.55},
+	Stance.PRONE: {"height": 0.5, "radius": 0.4, "center_y": 0.25},
+}
+## Camera pivot height per stance (see _update_camera()).
+const STANCE_PIVOT_Y: Dictionary = {Stance.STAND: 1.6, Stance.CROUCH: 1.05, Stance.PRONE: 0.35}
+
+## Clips that must finish playing before _update_animation() picks a new
+## locomotion state -- see the guard near the top of that function.
+const ACTION_CLIPS: Array[String] = [
+	"fire", "crouch_fire", "reload", "melee",
+	"stand_to_crouch", "prone_to_crouch", "stand_up",
+	"rifle_pull_out", "rifle_put_away",
+]
+
+## Per-stance locomotion clip names, keyed by movement direction relative to
+## facing (see _update_animation()). Forward pace (walk/run/sprint) is resolved
+## separately in _forward_pace_clip(); the other directions have exactly one
+## pace each. Missing directions fall back to the forward clip for that stance
+## -- the downloaded Mixamo set doesn't cover every combination (no mirrored
+## crouch-strafe-right, no continuous prone strafe/backward crawl loop).
+const LOCOMOTION_CLIPS: Dictionary = {
+	Stance.STAND: {
+		"idle": "idle", "aim_idle": "aim_idle",
+		"backward": "walk_backward", "left": "strafe_left", "right": "strafe_right",
+	},
+	Stance.CROUCH: {
+		"idle": "crouch_idle", "aim_idle": "crouch_aim_idle", "forward": "crouch_walk_forward",
+		"backward": "crouch_walk_backward", "left": "crouch_strafe_left", "right": "crouch_walk_forward",
+	},
+	Stance.PRONE: {
+		"idle": "prone_idle", "aim_idle": "prone_idle", "forward": "prone_forward",
+		"backward": "prone_backward", "left": "prone_forward", "right": "prone_forward",
+	},
+}
+## from_stance*10 + to_stance -> one-shot transition clip (Stance: STAND=0
+## CROUCH=1 PRONE=2). Pairs missing here (STAND<->PRONE directly) have no
+## dedicated clip in this asset set, so that transition just snaps.
+const STANCE_TRANSITION_CLIP: Dictionary = {
+	1: "stand_to_crouch",    # STAND -> CROUCH
+	10: "crouch_to_stand",   # CROUCH -> STAND (see rpc_set_stance -- played as "stand_to_crouch" in reverse)
+	21: "prone_to_crouch",   # PRONE -> CROUCH
+	20: "stand_up",          # PRONE -> STAND (user-provided "Stand Up.fbx")
+}
+
 ## Bone -> (hitbox key, local radius) used for the Шаг 4b modular hitboxes.
 ## Rough single-sphere-per-region approximation; adjust radii in the editor after
 ## seeing the actual model scale.
@@ -61,10 +170,49 @@ const HITBOX_BONES: Dictionary = {
 
 @export var model_scene: PackedScene = preload("res://Tony.fbx")
 @export var weapon_scene: PackedScene = preload("res://aks-74.fbx")
-@export var run_forward_clip: PackedScene = preload("res://Run Forward.fbx")
-@export var run_backward_clip: PackedScene = preload("res://Run Backward.fbx")
-@export var reload_clip: PackedScene = preload("res://Reloading.fbx")
 @export var dying_clip: PackedScene = preload("res://Dying.fbx")
+
+## Standing locomotion.
+@export var rifle_idle_clip: PackedScene = preload("res://Rifle Idle.fbx")
+@export var rifle_aim_idle_clip: PackedScene = preload("res://Rifle Aiming Idle.fbx")
+@export var rifle_walk_clip: PackedScene = preload("res://Rifle Walk.fbx")
+@export var rifle_run_clip: PackedScene = preload("res://Rifle Run.fbx")
+@export var walk_backward_clip: PackedScene = preload("res://Walk Backward.fbx")
+@export var sprint_clip: PackedScene = preload("res://Sprint.fbx")
+@export var strafe_left_clip: PackedScene = preload("res://Left Strafe.fbx")
+@export var strafe_right_clip: PackedScene = preload("res://Right Strafe.fbx")
+
+## Crouch.
+@export var crouch_idle_clip: PackedScene = preload("res://Crouch Idle.fbx")
+@export var crouch_aim_idle_clip: PackedScene = preload("res://Idle Crouching Aiming.fbx")
+@export var crouch_walk_clip: PackedScene = preload("res://Crouched Walking.fbx")
+@export var crouch_walk_backward_clip: PackedScene = preload("res://Crouch Walk Backwards Stop.fbx")
+@export var crouch_strafe_clip: PackedScene = preload("res://Crouch Walk Strafe Left.fbx")
+@export var crouch_fire_clip: PackedScene = preload("res://Crouch Rapid Fire.fbx")
+## No separate crouch_to_stand_clip -- "Crouch To Stand.fbx" turned out to be
+## the wrong animation (see REVIEW_NOTES.md); rpc_set_stance() plays this same
+## clip backwards instead so going down and coming up match exactly.
+@export var stand_to_crouch_clip: PackedScene = preload("res://Stand To Crouch.fbx")
+
+## Prone.
+@export var prone_idle_clip: PackedScene = preload("res://Prone Idle.fbx")
+@export var prone_forward_clip: PackedScene = preload("res://Prone Forward.fbx")
+@export var prone_backward_clip: PackedScene = preload("res://Prone Backwards Stop.fbx")
+@export var prone_to_crouch_clip: PackedScene = preload("res://Prone To Crouch Transition.fbx")
+@export var stand_up_clip: PackedScene = preload("res://Stand Up.fbx")
+
+## Weapon handling / combat.
+@export var firing_rifle_clip: PackedScene = preload("res://Firing Rifle.fbx")
+@export var reload_clip: PackedScene = preload("res://Reload.fbx")
+@export var rifle_pull_out_clip: PackedScene = preload("res://Rifle Pull Out.fbx")
+@export var rifle_put_away_clip: PackedScene = preload("res://Rifle Put Away.fbx")
+@export var rifle_punch_clip: PackedScene = preload("res://Rifle Punch.fbx")
+
+## Reactions / death. Non-lethal hits get a procedural jerk instead of a clip
+## -- see _play_hit_jerk() -- "Hit Reaction.fbx" turned out to play a crouch,
+## not a flinch.
+@export var death_headshot_clip: PackedScene = preload("res://Death From Front Headshot.fbx")
+@export var death_alt_clip: PackedScene = preload("res://Death From Right.fbx")
 
 ## Single Шаг-4a capsule (movement collider is separate; this is hitbox-layer only).
 @export var body_capsule_height: float = 1.7
@@ -87,9 +235,15 @@ var _spring_arm: SpringArm3D
 var _view: View = View.THIRD_PERSON
 var _aiming: bool = false
 var _weapon_slot: int = WeaponSlot.RIFLE
-var _idle_clip_name: String = ""
-var _idle_is_static_pose: bool = false
 var _current_clip: String = ""
+var _stance: int = Stance.STAND
+## Last non-idle movement direction key ("forward"/"backward"/"left"/"right")
+## actually observed, and when -- see ANIM_STOP_GRACE_SEC.
+var _last_move_dir: String = ""
+var _last_move_time: float = -1000.0
+## Current blend amount (0..1) of the procedural jump pose -- see
+## LegTuckModifier / JUMP_TUCK_BLEND_SPEED.
+var _leg_tuck_amount: float = 0.0
 
 var _hp: int = NetConfig.MAX_HP
 var _dead: bool = false
@@ -111,17 +265,11 @@ func _ready() -> void:
 	_build_movement_collision()
 	_build_model_and_skeleton()
 	_build_spine_modifier()
+	_build_leg_tuck_modifier()
 	_build_camera_rig()
 	_build_single_hitbox()
 	_build_replicator()
 	_merge_animation_clips()
-
-	# There is no Idle clip anywhere in this asset set (only Run Forward/Backward,
-	# Reloading, Dying), and Tony.fbx's own "mixamo_com" clip is the T-pose, so
-	# hold run_forward's first frame as a stand-in standing pose instead.
-	if _anim_player and _anim_player.has_animation("run_forward"):
-		_idle_clip_name = "run_forward"
-		_idle_is_static_pose = true
 
 	_hitbox_history = HitboxHistory.new()
 	_hitbox_history.name = "HitboxHistory"
@@ -142,19 +290,29 @@ func _exit_tree() -> void:
 # ---------------------------------------------------------------------------
 
 func _build_movement_collision() -> void:
-	var shape := CapsuleShape3D.new()
-	shape.height = 1.8
-	shape.radius = 0.35
 	var col := CollisionShape3D.new()
 	col.name = "MovementCollision"
-	col.shape = shape
-	col.position.y = 0.9
+	col.shape = CapsuleShape3D.new()
 	add_child(col)
+	_apply_stance_collision()  # sizes it from STANCE_COLLISION[Stance.STAND]
 	# Movement collider sees the environment AND other players' bodies (so two
 	# avatars can't walk through each other); kept off the dedicated hitbox
 	# layer so it never interferes with shot raycasts.
 	collision_layer = NetConfig.player_body_mask()
 	collision_mask = NetConfig.environment_mask() | NetConfig.player_body_mask()
+
+
+## Resizes MovementCollision for the current _stance. Same node throughout --
+## no real crouch/prone silhouette reference, see STANCE_COLLISION.
+func _apply_stance_collision() -> void:
+	var col := get_node_or_null("MovementCollision") as CollisionShape3D
+	if not col or not (col.shape is CapsuleShape3D):
+		return
+	var cfg: Dictionary = STANCE_COLLISION[_stance]
+	var shape := col.shape as CapsuleShape3D
+	shape.height = cfg["height"]
+	shape.radius = cfg["radius"]
+	col.position.y = cfg["center_y"]
 
 
 func _build_model_and_skeleton() -> void:
@@ -170,9 +328,9 @@ func _build_model_and_skeleton() -> void:
 	_skeleton = _find_child_of_type(model, Skeleton3D) as Skeleton3D
 	_anim_player = _find_child_of_type(model, AnimationPlayer) as AnimationPlayer
 	# NOTE: Tony.fbx's own baked clip imports as "mixamo_com" and is just the
-	# T-pose (that's the Mixamo base download), so it is deliberately NOT used
-	# as an idle -- doing so was exactly what left the character T-posing.
-	# The idle is picked in _ready() after the run clips have been merged in.
+	# T-pose (that's the Mixamo base download), so it is deliberately never
+	# merged in anywhere -- "Rifle Idle.fbx" (see _clip_table()) is the real
+	# idle now.
 	if _skeleton:
 		_attach_weapon()
 	else:
@@ -325,7 +483,7 @@ func _update_camera(delta: float) -> void:
 	var target_len: float
 	var target_offset: Vector3
 	var target_fov: float
-	var target_pivot: Vector3 = Vector3(0.0, 1.6, 0.0)
+	var target_pivot: Vector3 = Vector3(0.0, STANCE_PIVOT_Y.get(_stance, 1.6), 0.0)
 	var k := clampf(delta * CAMERA_BLEND_SPEED, 0.0, 1.0)
 	if _view == View.FIRST_PERSON:
 		target_len = 0.0
@@ -371,6 +529,7 @@ class SpinePitchModifier extends SkeletonModifier3D:
 
 
 var _spine_modifier: SpinePitchModifier
+var _hit_jerk_tween: Tween
 
 
 func _build_spine_modifier() -> void:
@@ -383,6 +542,51 @@ func _build_spine_modifier() -> void:
 		if idx != -1:
 			_spine_modifier.bone_indices.append(idx)
 	_skeleton.add_child(_spine_modifier)
+
+
+## Procedural "knees up" jump pose -- same SkeletonModifier3D technique as
+## SpinePitchModifier above, so it blends on top of whatever locomotion clip
+## is already animating the legs instead of replacing it. See
+## JUMP_TUCK_AIR_THRESHOLD for why this replaced a downloaded clip set.
+class LegTuckModifier extends SkeletonModifier3D:
+	var tuck: float = 0.0  # 0..1, blended in Player._update_animation()
+	var thigh_indices: Array[int] = []
+	var shin_indices: Array[int] = []
+
+	func _process_modification_with_delta(_delta: float) -> void:
+		var skeleton := get_skeleton()
+		if not skeleton or tuck <= 0.0:
+			return
+		# Bone-local +X is the same left-right axis SpinePitchModifier bends
+		# the torso around. Thighs rotate up-and-forward, shins fold the knee
+		# back the other way to bring the heel toward the seat -- signs are a
+		# best guess (not visually confirmed, no editor in this environment):
+		# flip either sign if a leg bends the wrong way or looks stiff.
+		var thigh_extra := Quaternion(Vector3.RIGHT, -JUMP_TUCK_THIGH_ANGLE * tuck)
+		for idx in thigh_indices:
+			skeleton.set_bone_pose_rotation(idx, skeleton.get_bone_pose_rotation(idx) * thigh_extra)
+		var shin_extra := Quaternion(Vector3.RIGHT, JUMP_TUCK_SHIN_ANGLE * tuck)
+		for idx in shin_indices:
+			skeleton.set_bone_pose_rotation(idx, skeleton.get_bone_pose_rotation(idx) * shin_extra)
+
+
+var _leg_tuck_modifier: LegTuckModifier
+
+
+func _build_leg_tuck_modifier() -> void:
+	if not _skeleton:
+		return
+	_leg_tuck_modifier = LegTuckModifier.new()
+	_leg_tuck_modifier.name = "LegTuck"
+	for bone_name in LEG_TUCK_THIGH_BONES:
+		var idx := _skeleton.find_bone(bone_name)
+		if idx != -1:
+			_leg_tuck_modifier.thigh_indices.append(idx)
+	for bone_name in LEG_TUCK_SHIN_BONES:
+		var idx := _skeleton.find_bone(bone_name)
+		if idx != -1:
+			_leg_tuck_modifier.shin_indices.append(idx)
+	_skeleton.add_child(_leg_tuck_modifier)
 
 
 func _process(delta: float) -> void:
@@ -448,6 +652,53 @@ func _build_replicator() -> void:
 	# it isn't already present at that point.
 	_replicator = get_node("FusionServerReplicator")
 	_replicator.connect("on_process_input", _on_process_input)
+	# TODO(revert-me): player.tscn's FusionServerReplicator temporarily has NO
+	# object_interpolation_time set (removed for testing, was 0.1 = 100ms proxy
+	# smoothing buffer). Without it, a peer that is neither owner nor master for
+	# a given Player shows its position exactly as Fusion's root_interpolation_mode
+	# delivers it, unsmoothed -- put the 0.1 back once that raw behaviour has been
+	# compared against it. See REVIEW_NOTES.md.
+
+
+## name -> [source scene, looping]. One entry per merged clip name used
+## throughout this script (LOCOMOTION_CLIPS, ACTION_CLIPS, STANCE_TRANSITION_CLIP,
+## _die(), _play_fire_clip(), ...). Getting Up.fbx is deliberately not in this
+## table -- no knockdown/stagger state exists in this prototype to trigger it.
+## Left Turn.fbx and Strafe Right.fbx are also unused (Right Strafe already
+## covers the strafe role; there is no turn-in-place feature -- see
+## REVIEW_NOTES.md, "Standing Turn 90 Left/Right" turned out to be a
+## look-around idle, not an actual turn, and was removed).
+func _clip_table() -> Dictionary:
+	return {
+		"idle": [rifle_idle_clip, true],
+		"aim_idle": [rifle_aim_idle_clip, true],
+		"walk_forward": [rifle_walk_clip, true],
+		"run_forward": [rifle_run_clip, true],
+		"sprint_forward": [sprint_clip, true],
+		"walk_backward": [walk_backward_clip, true],
+		"strafe_left": [strafe_left_clip, true],
+		"strafe_right": [strafe_right_clip, true],
+		"crouch_idle": [crouch_idle_clip, true],
+		"crouch_aim_idle": [crouch_aim_idle_clip, true],
+		"crouch_walk_forward": [crouch_walk_clip, true],
+		"crouch_walk_backward": [crouch_walk_backward_clip, true],
+		"crouch_strafe_left": [crouch_strafe_clip, true],
+		"crouch_fire": [crouch_fire_clip, false],
+		"stand_to_crouch": [stand_to_crouch_clip, false],
+		"prone_idle": [prone_idle_clip, true],
+		"prone_forward": [prone_forward_clip, true],
+		"prone_backward": [prone_backward_clip, true],
+		"prone_to_crouch": [prone_to_crouch_clip, false],
+		"stand_up": [stand_up_clip, false],
+		"fire": [firing_rifle_clip, false],
+		"reload": [reload_clip, false],
+		"rifle_pull_out": [rifle_pull_out_clip, false],
+		"rifle_put_away": [rifle_put_away_clip, false],
+		"melee": [rifle_punch_clip, false],
+		"dying": [dying_clip, false],
+		"death_headshot": [death_headshot_clip, false],
+		"death_alt": [death_alt_clip, false],
+	}
 
 
 func _merge_animation_clips() -> void:
@@ -457,10 +708,9 @@ func _merge_animation_clips() -> void:
 	if not lib:
 		lib = AnimationLibrary.new()
 		_anim_player.add_animation_library("", lib)
-	_merge_clip_into(lib, run_forward_clip, "run_forward", true)
-	_merge_clip_into(lib, run_backward_clip, "run_backward", true)
-	_merge_clip_into(lib, reload_clip, "reload", false)
-	_merge_clip_into(lib, dying_clip, "dying", false)
+	for clip_name: String in _clip_table():
+		var entry: Array = _clip_table()[clip_name]
+		_merge_clip_into(lib, entry[0], clip_name, entry[1])
 
 
 func _merge_clip_into(target_lib: AnimationLibrary, scene: PackedScene, new_name: String, looping: bool) -> void:
@@ -478,8 +728,12 @@ func _merge_clip_into(target_lib: AnimationLibrary, scene: PackedScene, new_name
 				# Mixamo exports come in with loop_mode = NONE, so a run cycle
 				# played once (0.5 s) and then froze mid-stride.
 				anim.loop_mode = Animation.LOOP_LINEAR if looping else Animation.LOOP_NONE
-				if looping:
-					_bake_in_place(anim)
+				# Applied unconditionally, not just to loops: a one-shot with
+				# baked-in hip travel (a turn, Stand Up, a jump...) would drag
+				# the mesh away from the physics-driven capsule for the clip's
+				# duration too -- same class of bug this was written to fix for
+				# the run cycles in the first place.
+				_bake_in_place(anim)
 				target_lib.add_animation(new_name, anim)
 				break  # each Mixamo "without skin" export has exactly one clip
 			if target_lib.has_animation(new_name):
@@ -541,6 +795,12 @@ func _unhandled_input(event: InputEvent) -> void:
 		_request_weapon_slot(WeaponSlot.RIFLE)
 	elif event.is_action_pressed("weapon_slot_2"):
 		_request_weapon_slot(WeaponSlot.HANDS)
+	elif event.is_action_pressed("crouch"):
+		_request_stance(Stance.STAND if _stance == Stance.CROUCH else Stance.CROUCH)
+	elif event.is_action_pressed("prone"):
+		_request_stance(Stance.STAND if _stance == Stance.PRONE else Stance.PRONE)
+	elif event.is_action_pressed("melee"):
+		_request_melee()
 
 
 func set_view(view: View) -> void:
@@ -564,17 +824,94 @@ func _request_weapon_slot(slot: int) -> void:
 
 @rpc("any_peer", "call_local")
 func rpc_set_weapon_slot(slot: int) -> void:
+	var drawing_rifle := slot == WeaponSlot.RIFLE and _weapon_slot != WeaponSlot.RIFLE
+	var stowing_rifle := slot == WeaponSlot.HANDS and _weapon_slot != WeaponSlot.HANDS
 	_weapon_slot = slot
 	_apply_weapon_slot()
 	_emit_local_status()
+	# Cosmetic overlay only -- the re-parent above is still instant, so this
+	# doesn't gate anything; it just plays alongside it.
+	if drawing_rifle:
+		_play_action("rifle_pull_out")
+	elif stowing_rifle:
+		_play_action("rifle_put_away")
+
+
+## Local input -> broadcast so every peer sees the same stance change.
+func _request_stance(new_stance: int) -> void:
+	if new_stance == _stance or _dead:
+		return
+	Fusion.rpc(rpc_set_stance, new_stance)
+
+
+@rpc("any_peer", "call_local")
+func rpc_set_stance(new_stance: int) -> void:
+	var clip: String = STANCE_TRANSITION_CLIP.get(_stance * 10 + new_stance, "")
+	_stance = new_stance
+	_apply_stance_collision()
+	if clip == "crouch_to_stand":
+		# "Crouch To Stand.fbx" was the wrong animation -- reuse "Stand To
+		# Crouch" played backwards instead, so going down and coming up match.
+		_play_action_reversed("stand_to_crouch", CROUCH_TRANSITION_SPEED_SCALE)
+	elif clip == "stand_to_crouch":
+		_play_action(clip, CROUCH_TRANSITION_SPEED_SCALE)
+	elif clip != "":
+		_play_action(clip)
+	_last_move_dir = ""
+	_emit_local_status()
+
+
+## Visual only -- no melee hit detection/damage yet, see REVIEW_NOTES.md.
+func _request_melee() -> void:
+	if _dead or _weapon_slot != WeaponSlot.RIFLE:
+		return
+	Fusion.rpc(rpc_play_melee)
+
+
+@rpc("any_peer", "call_local")
+func rpc_play_melee() -> void:
+	_play_action("melee")
+
+
+## Plays a one-shot "action" clip (fire/reload/melee/hit reaction/turn/jump/
+## landing/stance transition/draw/holster) that should finish uninterrupted
+## before _update_animation() resumes picking a locomotion clip -- see
+## ACTION_CLIPS.
+func _play_action(clip_name: String, speed_scale: float = 1.0) -> void:
+	if _anim_player and _anim_player.has_animation(clip_name):
+		_anim_player.play(clip_name, -1.0, speed_scale)
+		_current_clip = clip_name
+
+
+## Same as _play_action(), but plays clip_name backwards (from its last frame
+## to its first) -- used to fake a matching "stand up" out of a "sit/go down"
+## clip when no correct reverse animation exists (see rpc_set_stance()).
+func _play_action_reversed(clip_name: String, speed_scale: float = 1.0) -> void:
+	if _anim_player and _anim_player.has_animation(clip_name):
+		_anim_player.play(clip_name, -1.0, -speed_scale, true)
+		_current_clip = clip_name
+
+
+func _current_move_speed(sprinting: bool) -> float:
+	match _stance:
+		Stance.CROUCH:
+			return CROUCH_SPEED
+		Stance.PRONE:
+			return PRONE_SPEED
+		_:
+			return SPRINT_SPEED if sprinting else MOVE_SPEED
+
+
+const STANCE_STATUS_SUFFIX: Dictionary = {Stance.CROUCH: "   CROUCH [C]", Stance.PRONE: "   PRONE [Z]"}
 
 
 func _emit_local_status() -> void:
 	if MatchServer and _has_input_authority():
-		MatchServer.local_status_changed.emit("%s [Q]   %s [V]%s" % [
+		MatchServer.local_status_changed.emit("%s [Q]   %s [V]%s%s" % [
 			WEAPON_SLOT_NAMES[_weapon_slot],
 			"1st person" if _view == View.FIRST_PERSON else "3rd person",
 			"   AIM" if _aiming else "",
+			STANCE_STATUS_SUFFIX.get(_stance, ""),
 		])
 
 
@@ -609,14 +946,19 @@ func _physics_process(delta: float) -> void:
 			if _autofire_accum >= 2.0:
 				_autofire_accum = 0.0
 				fire_pressed = true
+		var sprint_held := Input.is_action_pressed("sprint")
+		var jump_pressed := Input.is_action_just_pressed("jump") and _stance == Stance.STAND
 		if _dead:
 			move_input = Vector2.ZERO
 			fire_pressed = false
+			jump_pressed = false
 		var payload := {
 			"move": move_input,
 			"yaw": _yaw,
 			"pitch": _pitch,
 			"fire": fire_pressed,
+			"sprint": sprint_held,
+			"jump": jump_pressed,
 		}
 		if _replicator:
 			_replicator.call("queue_input", delta, var_to_bytes(payload))
@@ -680,52 +1022,91 @@ func _update_animation(delta: float) -> void:
 		return
 	var apparent_velocity := (global_position - _prev_global_position) / delta
 	_prev_global_position = global_position
+
 	if _dead or not _anim_player:
 		return  # the death clip owns the skeleton until respawn
+
 	var horizontal := Vector2(apparent_velocity.x, apparent_velocity.z)
 	var speed := horizontal.length()
 
-	# Tracked as a *state*, not just a clip name: "idle" and "run_forward" can
-	# share the same underlying clip (idle is that clip frozen on frame 0), so
-	# comparing clip names alone would leave the character frozen while running.
-	var state := "idle"
+	# Procedural jump pose: blends continuously from vertical apparent velocity
+	# (observer-safe, like the rest of this function) instead of triggering a
+	# discrete clip -- see JUMP_TUCK_AIR_THRESHOLD.
+	var airborne := absf(apparent_velocity.y) > JUMP_TUCK_AIR_THRESHOLD
+	_leg_tuck_amount = move_toward(_leg_tuck_amount, 1.0 if airborne else 0.0, JUMP_TUCK_BLEND_SPEED * delta)
+	if _leg_tuck_modifier:
+		_leg_tuck_modifier.tuck = _leg_tuck_amount
+
+	if _current_clip in ACTION_CLIPS and _anim_player.is_playing():
+		return  # let a one-shot action (fire/reload/melee/stance change...) finish
+
+	# Tracked as a *direction key*, not a clip name: forward pace (walk/run/
+	# sprint) is resolved separately from instantaneous speed in
+	# _forward_pace_clip(), so the same "forward" key can map to different clips
+	# as speed changes without re-triggering the hysteresis below.
 	if speed > 0.35:
 		var forward := -transform.basis.z
+		var right := transform.basis.x
 		var along := Vector2(forward.x, forward.z).dot(horizontal) / speed  # -1..1
-		# Only two locomotion clips exist, so strafing has to pick one. Pure
-		# sideways motion has `along` ~ 0 and a plain sign test flipped between
-		# forward/backward every physics tick (each flip restarts the clip).
-		# Stick with the current clip inside a wide dead band instead.
-		if _current_clip == "run_backward":
-			state = "run_backward" if along < 0.35 else "run_forward"
+		var lateral := Vector2(right.x, right.z).dot(horizontal) / speed  # -1..1
+		# Dead band + hysteresis on whichever axis dominates, same reasoning as the
+		# old forward/backward-only version: a plain sign test at a near-zero axis
+		# value flips every physics tick (each flip restarts the clip). The axis
+		# CHOICE itself needs the same treatment (DIAGONAL_AXIS_HYSTERESIS) --
+		# without it, an exact diagonal sits right where abs(along) ~= abs(lateral)
+		# and flips between forward/strafe every tick instead.
+		var was_longitudinal := _last_move_dir != "left" and _last_move_dir != "right"
+		var longitudinal_wins: bool = (
+			absf(along) >= absf(lateral) - DIAGONAL_AXIS_HYSTERESIS if was_longitudinal
+			else absf(along) - DIAGONAL_AXIS_HYSTERESIS >= absf(lateral)
+		)
+		if longitudinal_wins:
+			if _last_move_dir == "backward":
+				_last_move_dir = "backward" if along < 0.35 else "forward"
+			else:
+				_last_move_dir = "backward" if along < -0.35 else "forward"
 		else:
-			state = "run_backward" if along < -0.35 else "run_forward"
+			if _last_move_dir == "left":
+				_last_move_dir = "left" if lateral < 0.35 else "right"
+			else:
+				_last_move_dir = "right" if lateral > -0.35 else "left"
+		_last_move_time = Time.get_ticks_msec() / 1000.0
+
+	var still_moving := _last_move_dir != "" \
+		and (Time.get_ticks_msec() / 1000.0) - _last_move_time < ANIM_STOP_GRACE_SEC
+	var dirs: Dictionary = LOCOMOTION_CLIPS[_stance]
+	var state: String
+	if not still_moving:
+		state = dirs["aim_idle"] if _aiming else dirs["idle"]
+	elif _last_move_dir == "forward":
+		state = _forward_pace_clip(speed)
+	else:
+		state = dirs.get(_last_move_dir, dirs.get("forward", dirs["idle"]))
 
 	if state == _current_clip:
 		return
-	# Don't cut the fire one-shot short while standing still; movement wins.
-	if _current_clip == "reload" and _anim_player.is_playing() and state == "idle":
-		return
-
-	if state == "idle":
-		if _idle_clip_name == "" or not _anim_player.has_animation(_idle_clip_name):
-			return
-		_anim_player.play(_idle_clip_name)
-		if _idle_is_static_pose:
-			_anim_player.seek(0.0, true)
-			_anim_player.pause()
-		_current_clip = state
-	elif _anim_player.has_animation(state):
+	if _anim_player.has_animation(state):
 		_anim_player.play(state)
 		_current_clip = state
+
+
+## Forward-direction locomotion clip for the current stance, picked from
+## *observed* speed rather than the sprint input flag -- see SPRINT_ANIM_SPEED_MIN.
+func _forward_pace_clip(speed: float) -> String:
+	if _stance != Stance.STAND:
+		return LOCOMOTION_CLIPS[_stance]["forward"]
+	if speed >= SPRINT_ANIM_SPEED_MIN:
+		return "sprint_forward"
+	elif speed >= RUN_ANIM_SPEED_MIN:
+		return "run_forward"
+	else:
+		return "walk_forward"
 
 
 func _play_fire_clip() -> void:
 	if _dead:
 		return
-	if _anim_player and _anim_player.has_animation("reload"):
-		_anim_player.play("reload")
-		_current_clip = "reload"
+	_play_action("crouch_fire" if _stance == Stance.CROUCH else "fire")
 
 
 # ---------------------------------------------------------------------------
@@ -746,7 +1127,10 @@ func _on_process_input(_tick: int, delta_time: float, payload: PackedByteArray, 
 	rotation.y = _yaw
 	if _camera_pivot:
 		_camera_pivot.rotation.x = _pitch
-	_apply_movement(Vector2.ZERO if _dead else input.get("move", Vector2.ZERO), delta_time)
+	_apply_movement(
+		Vector2.ZERO if _dead else input.get("move", Vector2.ZERO), delta_time,
+		input.get("sprint", false), input.get("jump", false)
+	)
 
 	# Only the visual here: the shot RPC itself is sent from the input sampling
 	# path in _physics_process, because this callback does not run at all on a
@@ -755,16 +1139,17 @@ func _on_process_input(_tick: int, delta_time: float, payload: PackedByteArray, 
 		_play_fire_clip()
 
 
-func _apply_movement(move_input: Vector2, delta_time: float) -> void:
+func _apply_movement(move_input: Vector2, delta_time: float, sprinting: bool, jump_pressed: bool) -> void:
 	var basis_fwd := -transform.basis.z
 	var basis_right := transform.basis.x
 	var dir := Vector3.ZERO
 	if move_input.length() > 0.01:
 		dir = (basis_right * move_input.x + basis_fwd * -move_input.y).normalized()
-	velocity.x = dir.x * MOVE_SPEED
-	velocity.z = dir.z * MOVE_SPEED
+	var speed := _current_move_speed(sprinting)
+	velocity.x = dir.x * speed
+	velocity.z = dir.z * speed
 	if is_on_floor():
-		velocity.y = 0.0
+		velocity.y = JUMP_VELOCITY if jump_pressed else 0.0
 	else:
 		velocity.y -= GRAVITY * delta_time
 	move_and_slide()
@@ -823,6 +1208,10 @@ func rpc_respawn(spawn_pos: Vector3) -> void:
 	# teleport() from the authority peer (logs an error elsewhere), so gate it.
 	if _replicator and _replicator.has_method("teleport") and bool(_replicator.call("has_authority")):
 		_replicator.call("teleport")
+	_stance = Stance.STAND
+	_apply_stance_collision()
+	_last_move_dir = ""
+	_leg_tuck_amount = 0.0
 	_current_clip = ""
 	if _anim_player:
 		_anim_player.stop()
@@ -833,20 +1222,40 @@ func rpc_respawn(spawn_pos: Vector3) -> void:
 # Health / death (mirrored on every peer from the master's hit report).
 # ---------------------------------------------------------------------------
 
-func apply_hit_result(hp_left: int, _position: Vector3) -> void:
+func apply_hit_result(hp_left: int, _position: Vector3, hit_bone: String = "") -> void:
 	_hp = hp_left
 	_emit_hp()
-	if hp_left <= 0 and not _dead:
-		_die()
+	if hp_left <= 0:
+		if not _dead:
+			_die(hit_bone)
+	else:
+		_play_hit_jerk()
 
 
-func _die() -> void:
+func _die(hit_bone: String = "") -> void:
 	_dead = true
 	velocity = Vector3.ZERO
 	_set_hitboxes_enabled(false)
-	if _anim_player and _anim_player.has_animation("dying"):
-		_anim_player.play("dying")  # LOOP_NONE: holds the final pose until respawn
-		_current_clip = "dying"
+	# Deterministic per-peer pick so every peer renders the same clip from only
+	# data already in the broadcast hit report (no extra RPC field needed): a
+	# headshot always uses the headshot clip, anything else alternates between
+	# the two generic death clips by the target's own id.
+	var clip := "death_headshot" if hit_bone == "head" else ("dying" if get_player_id() % 2 == 0 else "death_alt")
+	if _anim_player and _anim_player.has_animation(clip):
+		_anim_player.play(clip)  # LOOP_NONE: holds the final pose until respawn
+		_current_clip = clip
+
+
+## Procedural non-lethal-hit flinch -- see HIT_JERK_ROTATION comment above.
+func _play_hit_jerk() -> void:
+	if not _skeleton:
+		return
+	if _hit_jerk_tween and _hit_jerk_tween.is_valid():
+		_hit_jerk_tween.kill()
+	var axis := Vector3(randf_range(-1.0, 1.0), randf_range(-1.0, 1.0), randf_range(-1.0, 1.0)).normalized()
+	_skeleton.rotation = axis * HIT_JERK_ROTATION
+	_hit_jerk_tween = create_tween()
+	_hit_jerk_tween.tween_property(_skeleton, "rotation", Vector3.ZERO, HIT_JERK_RECOVER_SEC)
 
 
 func _set_hitboxes_enabled(enabled: bool) -> void:
