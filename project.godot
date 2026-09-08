@@ -25,6 +25,10 @@ MatchServer="*res://net/match_server.gd"
 window/stretch/mode="canvas_items"
 window/stretch/aspect="expand"
 
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/dgd_camera/plugin.cfg")
+
 [fusion]
 
 connection/app_id="30d40b50-4d67-4979-a0d7-204c1f2f0e6a"
@@ -118,7 +122,6 @@ melee={
 
 3d_physics/layer_1="environment"
 3d_physics/layer_2="player_body"
-3d_physics/layer_3="hitbox"
 
 [physics]
 

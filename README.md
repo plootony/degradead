@@ -2,7 +2,7 @@
 
 Prototype validating **Godot 4.7.2 + Photon Fusion (Godot SDK 3.0.0-preview-555), Client-Server topology with prediction**, a Mixamo character, and hitscan shooting with server-side validation.
 
-Not a game — a viability test. See [REVIEW_NOTES.md](REVIEW_NOTES.md) for architecture, SDK gotchas and known gaps.
+Networked shooter prototype. See [NETWORKING.md](NETWORKING.md) for the current network architecture and regression tests. [REVIEW_NOTES.md](REVIEW_NOTES.md) records earlier experiments; its network notes are historical.
 
 ## Running it on a fresh machine
 
@@ -29,7 +29,7 @@ Controls: `WASD` move, mouse look, **click** to capture the mouse, **Esc** to re
 
 Camera is DayZ-like: third person sits behind and over the right shoulder with the character low-centre; aiming pulls in tight over the shoulder and narrows the FOV; first person is at the eyes with the body and rifle rendered. The torso bends with the vertical look angle (a `SkeletonModifier3D` on top of the animation), so the rifle follows your aim in every view.
 
-Gameplay loop: 100 HP, body shot = 34 (head = 100 in modular mode), death plays the Mixamo "Dying" clip, respawn after 4 s at the next spawn point. Hits show a red burst on the target and a tracer from the muzzle; misses that reach level geometry show a dust burst there. Walls block shots. The join panel hides once you are in a room; HP is shown top-left. A stats block top-right shows FPS / frame time, physics rate, connection state, region, ping (`Fusion.get_rtt()`), room name and player count, local player id and master/client role, network time and spawned avatar count.
+Gameplay loop: 100 HP, body shot = 34 (head = 100 in modular mode), death plays the Mixamo "Dying" clip, respawn after 4 s at the next spawn point. Hits show a red burst on the target and a tracer from the muzzle (the shooter's own tracer is drawn immediately, before the master confirms the hit); misses that reach level geometry show a dust burst there. Walls block shots. The join panel hides once you are in a room; HP is shown top-left. A stats block top-right shows FPS / frame time, physics rate, connection state, region, ping (`Fusion.get_rtt()`), room name and player count, local player id and master/client role, network time and spawned avatar count.
 
 Headless test harness (no editor, no keyboard needed):
 
@@ -42,4 +42,4 @@ Run two instances with the same `--room` and compare their logs: `[POS ...]` lin
 - The Photon **App ID must be created with dashboard SDK "Version 3"** (Unreal/Godot). A Fusion-2 App ID fails room creation with `Unsupported Plugin` (32752). The committed App ID is already correct.
 - **Region**: `fusion/connection/default_region` is set to `eu`. This Fusion 3 preview App ID only exposes five Photon regions — `us`, `eu`, `asia`, `jp`, `sa`; `ru`/`rue`/`tr` and the rest return `Region X is not available (32756)`. Measured from Russia on 2026-09-07: eu ≈149 ms, us ≈209 ms, asia ≈289 ms, sa ≈354 ms, jp ≈379 ms. A per-run override is `Fusion.connect_to_photon(user_id, region, app_version)`.
 - `project.godot` pins the Windows rendering driver to **D3D12**. On a machine without D3D12 support, change `rendering/rendering_device/driver.windows` to `vulkan`.
-- Step 4b (per-bone hitboxes + lag compensation) is implemented but **off**: flip `HITBOX_MODE` to `"modular"` in `autoload/net_config.gd`.
+- Hit detection is **lag-compensated in both hitbox modes** (the master rewinds each target to what the shooter was looking at, using the shooter's own RTT). `NetConfig.HITBOX_MODE` only picks the shapes: `"single"` (default, one capsule per player) or `"modular"` (one sphere per bone, head = 100 damage). `NetConfig.LAG_COMPENSATION = false` resolves against current positions instead, to A/B the difference.

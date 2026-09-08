@@ -1,0 +1,48 @@
+[gd_resource type="Resource" script_class="DGDCameraSettings" format=3 uid="uid://d0a6t81melcu4"]
+
+[ext_resource type="Script" uid="uid://duitroy0aurjx" path="res://addons/dgd_camera/settings.gd" id="1"]
+[ext_resource type="Script" uid="uid://ba8ntb1yt06pj" path="res://addons/dgd_camera/profile.gd" id="2"]
+
+[sub_resource type="Resource" id="First"]
+script = ExtResource("2")
+distance = 0.0
+height = 1.68
+shoulder = 0.0
+forward_offset = -0.12
+fov = 80.0
+step_amplitude = 0.35
+shot_amplitude = 0.65
+hit_amplitude = 1.4
+
+[sub_resource type="Resource" id="FirstAim"]
+script = ExtResource("2")
+distance = 0.0
+height = 1.68
+shoulder = 0.0
+forward_offset = -0.12
+fov = 55.0
+step_amplitude = 0.08
+shot_amplitude = 0.4
+hit_amplitude = 1.4
+
+[sub_resource type="Resource" id="Third"]
+script = ExtResource("2")
+distance = 1.6
+height = 1.82
+shoulder = 0.55
+
+[sub_resource type="Resource" id="ThirdAim"]
+script = ExtResource("2")
+distance = 1.3
+height = 1.7
+shoulder = 0.6
+fov = 50.0
+step_amplitude = 0.08
+shot_amplitude = 0.2
+
+[resource]
+script = ExtResource("1")
+first_person = SubResource("First")
+first_person_aim = SubResource("FirstAim")
+third_person = SubResource("Third")
+third_person_aim = SubResource("ThirdAim")

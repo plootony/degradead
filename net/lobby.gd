@@ -19,10 +19,13 @@ var _join_panel: PanelContainer
 var _status_label: Label
 var _room_input: LineEdit
 var _hud: Control
+var _injury_panel: Control
 var _hp_label: Label
 var _weapon_label: Label
 var _stats_label: Label
 var _expecting_room: bool = false
+var _join_button: Button
+var _joining: bool = false
 
 
 func _ready() -> void:
@@ -39,6 +42,7 @@ func _ready() -> void:
 			Fusion.room_left.connect(_on_room_left)
 		Fusion.player_joined.connect(_on_player_joined)
 		Fusion.player_left.connect(_on_player_left)
+		Fusion.master_client_changed.connect(_on_master_client_changed)
 		# Diagnostic dump: confirms what the native extension actually resolved
 		# from project.godot's [fusion] section (app id / mode / region), so a
 		# single test run tells us whether those settings are even being read,
@@ -99,7 +103,7 @@ func _add_box(size: Vector3, pos: Vector3, color: Color) -> void:
 	shape.size = size
 	col.shape = shape
 	body.add_child(col)
-	body.collision_layer = 1 << 0  # "environment"
+	body.collision_layer = NetConfig.layer_mask(NetConfig.ENVIRONMENT_LAYER_BIT)
 	body.collision_mask = 0
 
 	var mesh_inst := MeshInstance3D.new()
@@ -132,8 +136,8 @@ func _build_spawner() -> void:
 
 func _on_player_joined(player_id: int, player_name: String) -> void:
 	print("Fusion: player joined -> id=%d name=%s" % [player_id, player_name])
-	if not Fusion.is_master_client():
-		return  # only the simulation server spawns networked objects
+	if not Fusion.is_master_client() or MatchServer.get_player(player_id):
+		return
 	var spawn_pos: Vector3 = MatchServer.next_spawn_point()
 	# spawn() returns the new node directly, so configure it synchronously here.
 	# (The pre-spawn Callable parameter was tried first and never fired in this
@@ -157,6 +161,7 @@ func _configure_spawned_player(node: Node, player_id: int, spawn_pos: Vector3) -
 	# from the class's registered PropertyName list, unlike root_path /
 	# owner_mode), so .set("input_authority", ...) silently no-ops here.
 	replicator.call("set_input_authority", player_id)
+	MatchServer.register_player(node)
 	print("[Lobby diag] spawned player_id=%d -> input_authority readback=%s" % [
 		player_id, replicator.call("get_input_authority")
 	])
@@ -164,6 +169,29 @@ func _configure_spawned_player(node: Node, player_id: int, spawn_pos: Vector3) -
 
 func _on_player_left(player_id: int, _was_active: bool) -> void:
 	print("Fusion: player left -> id=%d" % player_id)
+	if Fusion.is_master_client():
+		var player := MatchServer.get_player(player_id)
+		if player:
+			_spawner.call("despawn", player)
+
+
+func _on_master_client_changed(_old_id: int, _new_id: int) -> void:
+	if not Fusion.is_master_client():
+		return
+	# Defer until Fusion has applied ownership and room membership changes.
+	call_deferred("_remove_departed_players")
+
+
+func _remove_departed_players() -> void:
+	if not Fusion.is_in_room() or not Fusion.is_master_client():
+		return
+	var active: Array[int] = []
+	for member in Fusion.get_room().call("get_players"):
+		if not member.call("get_is_inactive"):
+			active.append(member.call("get_number"))
+	for player in _players_root.get_children():
+		if player.call("get_player_id") not in active:
+			_spawner.call("despawn", player)
 
 
 # ---------------------------------------------------------------------------
@@ -186,10 +214,10 @@ func _build_ui() -> void:
 	_room_input.custom_minimum_size = Vector2(220, 0)
 	vbox.add_child(_room_input)
 
-	var join_button := Button.new()
-	join_button.text = "Join"
-	join_button.pressed.connect(_on_join_pressed)
-	vbox.add_child(join_button)
+	_join_button = Button.new()
+	_join_button.text = "Join"
+	_join_button.pressed.connect(_on_join_pressed)
+	vbox.add_child(_join_button)
 
 	_status_label = Label.new()
 	_status_label.text = "Not connected"
@@ -203,17 +231,26 @@ func _build_ui() -> void:
 	_hud.visible = false
 	layer.add_child(_hud)
 
+	_injury_panel = preload("res://ui/injury_panel.gd").new()
+	_hud.add_child(_injury_panel)
+	_injury_panel.set_anchors_and_offsets_preset(Control.PRESET_TOP_LEFT)
+	_injury_panel.offset_left = 16
+	_injury_panel.offset_right = 116
+	_injury_panel.offset_top = 12
+	_injury_panel.offset_bottom = 112
+	MatchServer.local_injuries_changed.connect(_injury_panel.set_injuries)
+
 	_hp_label = Label.new()
-	_hp_label.position = Vector2(16, 12)
+	_hp_label.position = Vector2(132, 12)
 	_hp_label.add_theme_font_size_override("font_size", 22)
 	_hud.add_child(_hp_label)
 
 	_weapon_label = Label.new()
-	_weapon_label.position = Vector2(16, 44)
+	_weapon_label.position = Vector2(132, 44)
 	_weapon_label.add_theme_font_size_override("font_size", 16)
-	_weapon_label.text = "AKS-74 [Q]   3rd person [V]"
+	_weapon_label.text = ""  # filled by Player._emit_local_status() once it owns input
 	_hud.add_child(_weapon_label)
-	MatchServer.local_status_changed.connect(func(text: String) -> void: _weapon_label.text = text)
+	MatchServer.local_status_changed.connect(_on_local_status_changed)
 
 	var crosshair := Label.new()
 	crosshair.text = "+"
@@ -248,10 +285,22 @@ func _build_ui() -> void:
 	_on_local_hp_changed(NetConfig.MAX_HP)
 
 
+## MatchServer is an autoload that outlives this scene: drop our listeners so a
+## scene reload can't leave callables into freed labels hanging on its signals.
+func _exit_tree() -> void:
+	if is_instance_valid(_injury_panel) and MatchServer.local_injuries_changed.is_connected(_injury_panel.set_injuries):
+		MatchServer.local_injuries_changed.disconnect(_injury_panel.set_injuries)
+	if MatchServer.local_status_changed.is_connected(_on_local_status_changed):
+		MatchServer.local_status_changed.disconnect(_on_local_status_changed)
+	if MatchServer.local_hp_changed.is_connected(_on_local_hp_changed):
+		MatchServer.local_hp_changed.disconnect(_on_local_hp_changed)
+
+
+func _on_local_status_changed(text: String) -> void:
+	_weapon_label.text = text
+
+
 const STATS_REFRESH_SEC: float = 0.25
-const STATUS_NAMES: Dictionary = {
-	0: "disconnected", 1: "connecting", 2: "connected", 3: "joining room", 4: "in room", 5: "error",
-}
 
 
 func _refresh_stats() -> void:
@@ -264,7 +313,7 @@ func _refresh_stats() -> void:
 		return
 
 	var status: int = Fusion.get_connection_status()
-	lines.append("net: %s" % STATUS_NAMES.get(status, str(status)))
+	lines.append("net: %s" % NetConfig.CONNECTION_STATUS_NAMES.get(status, str(status)))
 	lines.append("region %s" % Fusion.get_default_region())
 	if status >= NetConfig.CONNECTION_STATUS_CONNECTED:
 		# get_rtt() returns seconds (observed ~0.2 against the "us" region).
@@ -308,19 +357,33 @@ func _initial_room_code() -> String:
 
 
 func _on_join_pressed() -> void:
-	if not Engine.has_singleton("Fusion"):
+	if not Engine.has_singleton("Fusion") or _joining or Fusion.is_in_room():
 		return
-	_status_label.text = "Connecting..."
-	Fusion.connect_to_photon()
+	_room_input.text = _room_input.text.strip_edges()
+	if _room_input.text.is_empty():
+		_status_label.text = "Enter a room code"
+		return
+	_joining = true
+	_join_button.disabled = true
+	if Fusion.is_connected_to_photon():
+		_on_connected_to_photon()
+	else:
+		_status_label.text = "Connecting..."
+		Fusion.connect_to_photon("", "", NetConfig.NETWORK_VERSION)
 
 
 func _on_connected_to_photon() -> void:
 	_status_label.text = "Connected, joining room '%s'..." % _room_input.text
 	_expecting_room = true
-	Fusion.join_or_create_room(_room_input.text)
+	var options = ClassDB.instantiate("FusionRoomOptions")
+	options.call("set_player_ttl_ms", 0)
+	options.call("set_empty_room_ttl_ms", 0)
+	Fusion.join_or_create_room(_room_input.text, options)
 
 
 func _on_connection_failed(reason: String) -> void:
+	_joining = false
+	_join_button.disabled = false
 	_expecting_room = false
 	_status_label.text = "Connection failed: %s" % reason
 	print("[Fusion diag] connection_failed: %s" % reason)
@@ -333,12 +396,18 @@ func _on_connection_failed(reason: String) -> void:
 ## the failure in the UI instead of it only ever showing up in the console.
 func _on_connection_status_changed(status: int) -> void:
 	print("[Fusion diag] connection_status_changed -> %d" % status)
+	if status == NetConfig.CONNECTION_STATUS_DISCONNECTED or status == NetConfig.CONNECTION_STATUS_ERROR:
+		_on_room_left()
 	if _expecting_room and status == NetConfig.CONNECTION_STATUS_CONNECTED:
 		_expecting_room = false
+		_joining = false
+		_join_button.disabled = false
 		_status_label.text = "Room join failed (see console for the exact Photon error)."
 
 
 func _on_room_joined() -> void:
+	_joining = false
+	_join_button.disabled = false
 	_expecting_room = false
 	_status_label.text = "In room '%s' (%d players)" % [
 		_room_input.text, Fusion.get_room().player_count if Fusion.get_room() else 1
@@ -351,6 +420,14 @@ func _on_room_joined() -> void:
 
 
 func _on_room_left() -> void:
+	_joining = false
+	_expecting_room = false
+	_join_button.disabled = false
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	for player in _players_root.get_children():
+		player.queue_free()
+	MatchServer.reset_session()
 	_join_panel.visible = true
 	_hud.visible = false
+	_injury_panel.set_injuries(0, NetConfig.MAX_HP)
 	_status_label.text = "Left room"

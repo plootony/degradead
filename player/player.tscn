@@ -1,13 +1,28 @@
-[gd_scene load_steps=2 format=3]
+[gd_scene load_steps=3 format=3]
 
 [ext_resource type="Script" path="res://player/player.gd" id="1"]
+
+[sub_resource type="FusionReplicationConfig" id="ReplicationState"]
+property_count = 10
+properties/0/path = NodePath(":_hp")
+properties/1/path = NodePath(":_life_id")
+properties/2/path = NodePath(":_respawn_at")
+properties/3/path = NodePath(":_stance")
+properties/4/path = NodePath(":_weapon_slot")
+properties/5/path = NodePath(":_pitch")
+properties/6/path = NodePath(":_aiming")
+properties/7/path = NodePath(":_last_shot_sequence")
+properties/8/path = NodePath(":_next_fire_at")
+properties/9/path = NodePath(":_injured_parts")
 
 [node name="Player" type="CharacterBody3D"]
 script = ExtResource("1")
 
 [node name="FusionServerReplicator" type="FusionServerReplicator" parent="."]
 root_path = NodePath("..")
+replication_config = SubResource("ReplicationState")
 owner_mode = 5
 root_replication_mode = 1
 root_interpolation_mode = 1
 root_teleport_threshold = 2.5
+root_snap_distance = 2.5
