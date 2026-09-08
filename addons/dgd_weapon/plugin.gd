@@ -14,6 +14,8 @@ func _enter_tree() -> void:
 	workspace.library = library
 	workspace.property_edited.connect(_edit_property)
 	workspace.add_requested.connect(func(): _dialog.popup_centered_ratio(0.7))
+	workspace.reset_requested.connect(_reset)
+	workspace.attach_requested.connect(_attach)
 	workspace.duplicate_requested.connect(_duplicate)
 	workspace.save_requested.connect(_save)
 	workspace.inspect_requested.connect(func(): EditorInterface.edit_resource(workspace.current_profile()))
@@ -46,12 +48,18 @@ func _make_visible(visible: bool) -> void:
 func _edit_property(object: Resource, key: String, value: Variant) -> void:
 	if object.get(key) == value: return
 	var undo := get_undo_redo()
-	undo.create_action("Оружие IK: %s / %s" % [object.get_instance_id(), key], UndoRedo.MERGE_ENDS, library)
+	# A free placement is editor state, not catalogue data: it must not dirty the library, and it
+	# has no resource path, so its undo entries belong to the global history rather than the catalogue's.
+	var placement := object is DGDWeaponPlacement
+	var method := "_moved" if placement else "_changed"
+	undo.create_action("Оружие IK: %s / %s" % [object.get_instance_id(), key], UndoRedo.MERGE_ENDS, object if placement else library)
 	undo.add_do_property(object, key, value)
 	undo.add_undo_property(object, key, object.get(key))
-	undo.add_do_method(self,"_changed",key)
-	undo.add_undo_method(self,"_changed",key)
+	undo.add_do_method(self,method,key)
+	undo.add_undo_method(self,method,key)
 	undo.commit_action()
+func _moved(_key: String = "") -> void:
+	workspace.refresh()
 func _changed(key: String = "") -> void:
 	_dirty = true
 	workspace.refresh()
@@ -75,6 +83,23 @@ func _add_model(path: String) -> void:
 	p.model = scene
 	p.hidden_nodes = PackedStringArray()
 	_append(p)
+func _apply(changes: Array, label: String) -> bool:
+	if changes.is_empty(): return false
+	var undo := get_undo_redo()
+	undo.create_action("Оружие IK: " + label, UndoRedo.MERGE_DISABLE, library)
+	for change in changes:
+		undo.add_do_property(change[0], change[1], change[2])
+		undo.add_undo_property(change[0], change[1], change[0].get(change[1]))
+	undo.add_do_method(self,"_changed")
+	undo.add_undo_method(self,"_changed")
+	undo.commit_action()
+	return true
+func _reset() -> void:
+	if _apply(workspace.default_values(), "сброс по умолчанию"):
+		workspace.status("Сброшено к анимации Mixamo. Кисти и локти общие для всех поз профиля; веса IK и поправка позы — только «%s». Ctrl+Z — отмена." % DGDWeaponProfile.STATES[workspace.state])
+func _attach() -> void:
+	if _apply(workspace.attach_values(), "прилипание оружия"):
+		workspace.status("Оружие закреплено на кисти, базовая опора пересчитана по «%s». Остальные позы сдвинулись на ту же дельту. Ctrl+Z — отмена." % DGDWeaponProfile.STATES[workspace.state])
 func _duplicate() -> void:
 	var p: DGDWeaponProfile = workspace.current_profile().duplicate(true)
 	p.id = "weapon_%d" % Time.get_ticks_usec()

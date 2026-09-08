@@ -9,6 +9,8 @@ const TARGETS: Array[String] = ["Оружие — поправка позы", "�
 var profile: DGDWeaponProfile
 var pose_index := 0
 var selected := 2
+var detached := false
+var detached_transform := Transform3D.IDENTITY
 var playing := true
 var clip := "idle"
 var speed := 1.0
@@ -108,17 +110,30 @@ func set_clip(value: String) -> void:
 func seek(time: float) -> void:
 	if animator: animator.seek(time, true)
 
+## Pre-IK Mixamo hands on the first frame of a clip. Frame 0 keeps a reset reproducible,
+## and showing that frame afterwards makes the reference pose visible.
+func sample_animated_hands(name: String) -> Array[Transform3D]:
+	if not animator or not skeleton or not modifier: return []
+	set_clip(name)
+	skeleton.advance(0.0)
+	if not modifier.validation_error.is_empty(): return []
+	return [modifier.reference_hand, modifier.reference_left_hand]
+
 func _process(delta: float) -> void:
 	if not is_visible_in_tree() or not modifier or not profile: return
 	modifier.profile = profile
 	modifier.state = pose_index
 	modifier.allow_ik = clip not in ["reload", "melee", "rifle_pull_out", "rifle_put_away", "dying"]
+	modifier.detached = detached
+	modifier.detached_transform = detached_transform
 	if playing: animator.advance(minf(delta, 0.1) * speed)
 	skeleton.advance(minf(delta, 0.1))
 	var center := Vector3(0, 1.05 if pose_index < 4 else 0.4, 0)
 	camera.position = center + Vector3(sin(_yaw)*cos(_pitch), sin(_pitch), cos(_yaw)*cos(_pitch)) * _distance
 	camera.look_at(center)
 	for i in _markers.size():
+		# A detached weapon overrides the pose offset, so its marker would be a dead control.
+		_markers[i].visible = not (detached and i == 0)
 		_markers[i].position = point_for(i)
 		_markers[i].scale = Vector3.ONE * (1.5 if i == selected else 1.0)
 		_markers[i].material_override.albedo_color = Color.YELLOW if i == selected else (Color("f27770") if i in [1,3] else Color("68dbcf"))
@@ -133,7 +148,7 @@ func point_for(target: int) -> Vector3:
 		3: return skeleton.global_transform * Vector3(modifier.targets.right_pole)
 		4: return skeleton.global_transform * Vector3(modifier.targets.left_pole)
 		5: return mount * profile.muzzle_position
-		6: return (skeleton.global_transform * modifier.reference_hand * profile.transform_at(profile.mount_position, profile.mount_rotation)).origin
+		6: return modifier.weapon_root.global_transform.origin if detached else (skeleton.global_transform * modifier.reference_hand * profile.transform_at(profile.mount_position, profile.mount_rotation)).origin
 	return Vector3.ZERO
 
 func value_from_world(target: int, world: Vector3) -> Vector3:
@@ -143,7 +158,7 @@ func value_from_world(target: int, world: Vector3) -> Vector3:
 		1,2,5: return modifier.weapon_root.global_transform.affine_inverse() * world
 		3: return local - (Vector3(modifier.targets.right_pole) - profile.right_pole)
 		4: return local - (Vector3(modifier.targets.left_pole) - profile.left_pole)
-		6: return modifier.reference_hand.affine_inverse() * local
+		6: return local if detached else modifier.reference_hand.affine_inverse() * local
 	return Vector3.ZERO
 
 func _gui_input(event: InputEvent) -> void:
@@ -164,7 +179,7 @@ func _gui_input(event: InputEvent) -> void:
 				var best := 22.0
 				var found := -1
 				for i in _markers.size():
-					if camera.is_position_behind(point_for(i)): continue
+					if not _markers[i].visible or camera.is_position_behind(point_for(i)): continue
 					var d := camera.unproject_position(point_for(i)).distance_to(mouse)
 					if d < best: best = d; found = i
 				if found >= 0:

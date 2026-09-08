@@ -8,12 +8,16 @@ var profile: DGDWeaponProfile
 var state := 0
 var equipped := true
 var allow_ik := true
+# Editor only: the weapon ignores the bones and sits at a hand-placed transform in skeleton space.
+var detached := false
+var detached_transform := Transform3D.IDENTITY
 var weapon_root: Node3D
 var model: Node3D
 var muzzle: Marker3D
 var final_frames: Dictionary = {}
 var targets: Dictionary = {}
 var reference_hand := Transform3D.IDENTITY
+var reference_left_hand := Transform3D.IDENTITY
 var right_error := 0.0
 var left_error := 0.0
 var validation_error := ""
@@ -78,16 +82,18 @@ func _process_modification_with_delta(delta: float) -> void:
 	_pose_transform = _pose_transform.interpolate_with(profile.transform_at(pose.position, pose.rotation_degrees), blend)
 	_right_weight = lerpf(_right_weight, pose.right_weight, blend)
 	_left_weight = lerpf(_left_weight, pose.left_weight, blend)
-	_weight = lerpf(_weight, 1.0 if equipped and allow_ik else 0.0, blend)
+	_weight = lerpf(_weight, 1.0 if equipped and allow_ik and not detached else 0.0, blend)
 	var animated_hand := s.get_bone_global_pose(_right[2])
 	reference_hand = animated_hand
+	reference_left_hand = s.get_bone_global_pose(_left[2])
 	# Read the unmodified animation once. Never parent the weapon to a solved hand.
 	var mount := animated_hand * profile.transform_at(profile.mount_position, profile.mount_rotation) * _pose_transform
 	if not equipped and _back >= 0:
 		mount = s.get_bone_global_pose(_back) * profile.transform_at(profile.holster_position, profile.holster_rotation)
 	if profile.firing:
 		shot_motion.advance(delta,profile.firing)
-		if equipped: mount *= shot_motion.weapon_transform(profile.firing,profile.transform_at(Vector3.ZERO,profile.muzzle_rotation).basis)
+		if equipped and not detached: mount *= shot_motion.weapon_transform(profile.firing,profile.transform_at(Vector3.ZERO,profile.muzzle_rotation).basis)
+	if detached: mount = detached_transform
 	weapon_root.transform = mount
 	muzzle.transform = profile.transform_at(profile.muzzle_position, profile.muzzle_rotation)
 	var right_goal := mount * profile.transform_at(profile.right_position, profile.right_rotation)

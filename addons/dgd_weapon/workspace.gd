@@ -2,18 +2,26 @@
 extends VBoxContainer
 signal property_edited(object: Resource, key: String, value: Variant)
 signal add_requested
+signal reset_requested
+signal attach_requested
 signal duplicate_requested
 signal save_requested
 signal inspect_requested
 const PREVIEW = preload("res://addons/dgd_weapon/preview.gd")
+const PLACEMENT = preload("res://addons/dgd_weapon/placement.gd")
 var library: DGDWeaponLibrary
 var selected := 0
 var state := 0
 var target := 2
+var detached := false
+var free_mount: DGDWeaponPlacement = PLACEMENT.new()
 var preview: SubViewportContainer
 var _weapons: OptionButton
 var _states: OptionButton
+var _clips: OptionButton
 var _targets: OptionButton
+var _detach: CheckButton
+var _play: CheckButton
 var _title: LineEdit
 var _position: Array[SpinBox] = []
 var _rotation: Array[SpinBox] = []
@@ -27,6 +35,7 @@ var _metrics: Label
 var _refreshing := false
 const POSITION_KEYS := ["position", "right_position", "left_position", "right_pole", "left_pole", "muzzle_position", "mount_position"]
 const ROTATION_KEYS := ["rotation_degrees", "right_rotation", "left_rotation", "", "", "muzzle_rotation", "mount_rotation"]
+const STATE_CLIPS: Array[String] = ["idle", "aim_idle", "crouch_idle", "crouch_aim_idle", "prone_idle", "prone_idle"]
 
 func _ready() -> void:
 	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
@@ -60,15 +69,15 @@ func _ready() -> void:
 	left.add_child(hint)
 	var playback := HBoxContainer.new()
 	left.add_child(playback)
-	var clips := OptionButton.new()
-	for name in PREVIEW.CLIPS: clips.add_item(name)
-	clips.item_selected.connect(func(i): preview.set_clip(PREVIEW.CLIPS[i]))
-	playback.add_child(clips)
-	var play := CheckButton.new()
-	play.text = "Играть"
-	play.button_pressed = true
-	play.toggled.connect(func(on): preview.playing = on)
-	playback.add_child(play)
+	_clips = OptionButton.new()
+	for name in PREVIEW.CLIPS: _clips.add_item(name)
+	_clips.item_selected.connect(func(i): preview.set_clip(PREVIEW.CLIPS[i]))
+	playback.add_child(_clips)
+	_play = CheckButton.new()
+	_play.text = "Играть"
+	_play.button_pressed = true
+	_play.toggled.connect(func(on): preview.playing = on)
+	playback.add_child(_play)
 	var rate := SpinBox.new()
 	rate.min_value = 0.1
 	rate.max_value = 2.0
@@ -102,15 +111,19 @@ func _ready() -> void:
 	for text in DGDWeaponProfile.STATES: _states.add_item(text)
 	_states.item_selected.connect(func(i):
 		state = i
-		preview.set_clip(["idle","aim_idle","crouch_idle","crouch_aim_idle","prone_idle","prone_idle"][i])
-		clips.select(PREVIEW.CLIPS.find(preview.clip))
+		preview.set_clip(STATE_CLIPS[i])
 		refresh())
 	fields.add_child(_states)
+	_button(fields, "Сброс по умолчанию", func(): reset_requested.emit())
 	_label(fields, "Что настраивать")
 	_targets = OptionButton.new()
 	for text in PREVIEW.TARGETS: _targets.add_item(text)
 	_targets.item_selected.connect(func(i): target = i; refresh())
 	fields.add_child(_targets)
+	_detach = CheckButton.new()
+	_detach.text = "Открепить оружие"
+	_detach.toggled.connect(_set_detached)
+	fields.add_child(_detach)
 	_position = _vector_controls(fields, "Положение, м", false)
 	_rotation = _vector_controls(fields, "Вращение, °", true)
 	_right = _number(fields, "IK правой руки", 0, 1, 0.01, func(v):
@@ -130,11 +143,73 @@ func current_profile() -> DGDWeaponProfile:
 	return library.profiles[selected]
 
 func selected_object() -> Resource:
-	return current_profile().pose_at(state) if target == 0 else current_profile()
+	if target == 0: return current_profile().pose_at(state)
+	if target == 6 and detached: return free_mount
+	return current_profile()
+
+## Detaching frees the weapon from the hand at exactly where it already sits, so nothing jumps;
+## attaching turns that placement back into a mount offset. Playback pauses on detach because
+## the bake reads the animated hand of the frame on screen.
+func _set_detached(on: bool) -> void:
+	if _refreshing or on == detached: return
+	if on:
+		var placed: Transform3D = preview.modifier.weapon_root.transform
+		free_mount.mount_position = placed.origin
+		free_mount.mount_rotation = _degrees(placed.basis)
+		detached = true
+		target = 6
+		_play.button_pressed = false
+		status("Оружие откреплено: ставьте его свободно, руки играют чистую анимацию. Снимите галочку, чтобы вернуть прилипание.")
+	else:
+		attach_requested.emit()
+		detached = false
+	refresh()
+
+## Mount offset that puts a re-attached weapon back on the free placement. The pose offset is
+## divided out, so the state on screen lands exactly where it was put while the others only shift.
+func attach_values() -> Array:
+	if not detached or not preview or not preview.modifier: return []
+	var p := current_profile()
+	var pose := p.pose_at(state)
+	var placed := DGDWeaponProfile.transform_at(free_mount.mount_position, free_mount.mount_rotation)
+	var offset := DGDWeaponProfile.transform_at(pose.position, pose.rotation_degrees)
+	var mount: Transform3D = preview.modifier.reference_hand.affine_inverse() * placed * offset.affine_inverse()
+	return [[p, "mount_position", mount.origin], [p, "mount_rotation", _degrees(mount.basis)]]
+
+## Mixamo defaults for the current state, as [object, key, value] triples: the grips land on
+## the animated hands, the elbows keep the animated bend, the pose offset goes away.
+## The mount is left alone — Mixamo carries no weapon, so it has no default to restore.
+func default_values() -> Array:
+	if not preview: return []
+	var p := current_profile()
+	var hands: Array = preview.sample_animated_hands(STATE_CLIPS[state])
+	refresh()
+	if hands.size() != 2:
+		var problem: String = preview.modifier.validation_error if preview.modifier else ""
+		status("Сброс невозможен: " + (problem if not problem.is_empty() else "нет предпросмотра скелета."))
+		return []
+	var animated_right: Transform3D = hands[0]
+	var animated_left: Transform3D = hands[1]
+	var mount := p.transform_at(p.mount_position, p.mount_rotation)
+	# right_goal = hand * mount * right, so the grip that keeps the wrist animated is mount inverted.
+	var right := mount.affine_inverse()
+	var left := (animated_right * mount).affine_inverse() * animated_left
+	var pose := p.pose_at(state)
+	return [
+		[p, "right_position", right.origin], [p, "right_rotation", _degrees(right.basis)],
+		[p, "left_position", left.origin], [p, "left_rotation", _degrees(left.basis)],
+		[p, "right_pole", Vector3.ZERO], [p, "left_pole", Vector3.ZERO],
+		[pose, "position", Vector3.ZERO], [pose, "rotation_degrees", Vector3.ZERO],
+		[pose, "right_weight", 1.0], [pose, "left_weight", 1.0],
+	]
+
+func _degrees(basis: Basis) -> Vector3:
+	return basis.orthonormalized().get_euler() * 180.0 / PI
 
 func refresh() -> void:
 	if not preview: return
 	_refreshing = true
+	if detached and target == 0: target = 6
 	var p := current_profile()
 	_weapons.clear()
 	for profile in library.profiles: _weapons.add_item(profile.title + (" ✓" if profile.id == library.default_id else ""))
@@ -143,6 +218,10 @@ func refresh() -> void:
 	_states.select(state)
 	_targets.select(target)
 	if preview.profile != p: preview.set_profile(p)
+	if _clips: _clips.select(PREVIEW.CLIPS.find(preview.clip))
+	if _detach: _detach.set_pressed_no_signal(detached)
+	preview.detached = detached
+	preview.detached_transform = DGDWeaponProfile.transform_at(free_mount.mount_position, free_mount.mount_rotation)
 	preview.pose_index = state
 	preview.selected = target
 	var object := selected_object()

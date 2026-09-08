@@ -85,6 +85,45 @@ func run(plugin: EditorPlugin) -> void:
 	history.undo()
 	plugin._save()
 	check(p.left_position.is_equal_approx(old) and plugin.library.profiles.size()==count, "restored_defaults")
+	ui.state = 0
+	ui.refresh()
+	var before: Vector3 = p.left_position
+	var mount: Transform3D = p.transform_at(p.mount_position, p.mount_rotation)
+	ui.reset_requested.emit()
+	check(ui.preview.clip == "idle", "reset_uses_state_clip")
+	check(p.right_pole.is_zero_approx() and p.left_pole.is_zero_approx(), "reset_clears_poles")
+	check(p.pose_at(0).position.is_zero_approx() and p.pose_at(0).right_weight == 1.0 and p.pose_at(0).left_weight == 1.0, "reset_pose_defaults")
+	check(p.transform_at(p.right_position,p.right_rotation).is_equal_approx(mount.affine_inverse()), "reset_right_grip")
+	ui.preview.playing = false
+	ui.preview.seek(0)
+	for i in 40: await plugin.get_tree().process_frame
+	check(ui.preview.modifier.right_error < 0.001 and ui.preview.modifier.left_error < 0.001, "reset_matches_mixamo")
+	history.undo()
+	check(p.left_position.is_equal_approx(before), "reset_undo")
+	plugin._save()
+	ui.preview.seek(0)
+	for i in 30: await plugin.get_tree().process_frame
+	var attached_at: Transform3D = ui.preview.modifier.weapon_root.transform
+	var mount_before: Vector3 = p.mount_position
+	ui._detach.button_pressed = true
+	for i in 15: await plugin.get_tree().process_frame
+	check(ui.detached and ui.target == 6, "detach_selects_weapon")
+	check(ui.preview.modifier.weapon_root.transform.is_equal_approx(attached_at), "detach_keeps_place")
+	ui._position[0].value = ui.free_mount.mount_position.x + 0.05
+	for i in 5: await plugin.get_tree().process_frame
+	var moved_x: float = ui.free_mount.mount_position.x
+	var placed: Transform3D = ui.preview.modifier.weapon_root.transform
+	check(is_equal_approx(placed.origin.x, moved_x) and absf(moved_x - attached_at.origin.x - 0.05) < 0.005, "detached_free_move")
+	check(p.mount_position.is_equal_approx(mount_before), "detached_leaves_profile")
+	check(ui.preview.modifier._weight < 0.2, "detached_drops_ik")
+	ui._detach.button_pressed = false
+	for i in 30: await plugin.get_tree().process_frame
+	check(not ui.detached, "attach_clears_flag")
+	check(ui.preview.modifier.weapon_root.transform.is_equal_approx(placed), "attach_bakes_mount")
+	history.undo()
+	check(p.mount_position.is_equal_approx(mount_before), "attach_undo")
+	plugin._save()
+	ui.preview.playing = true
 	if "--visual" in OS.get_cmdline_user_args():
 		plugin._open()
 		await plugin.get_tree().create_timer(0.5).timeout

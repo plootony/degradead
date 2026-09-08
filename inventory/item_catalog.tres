@@ -1,7 +1,7 @@
-[gd_resource type="Resource" script_class="DGDItemCatalog" load_steps=3 format=3]
+[gd_resource type="Resource" script_class="DGDItemCatalog" format=3 uid="uid://x5pwulpvgxnt"]
 
-[ext_resource type="Script" path="res://inventory/item_catalog.gd" id="1"]
-[ext_resource type="Script" path="res://inventory/item_def.gd" id="2"]
+[ext_resource type="Script" uid="uid://dg6jjwsm2qg38" path="res://inventory/item_catalog.gd" id="1"]
+[ext_resource type="Script" uid="uid://bn50cr6r4g44s" path="res://inventory/item_def.gd" id="2"]
 
 [sub_resource type="Resource" id="Item_aks74"]
 script = ExtResource("2")
@@ -10,7 +10,6 @@ title = "АКС-74"
 type = 0
 weapon_profile_id = "aks74"
 allowed_slots = Array[int]([0, 1])
-max_stack = 1
 
 [sub_resource type="Resource" id="Item_ammo_545x39"]
 script = ExtResource("2")
