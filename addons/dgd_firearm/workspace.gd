@@ -11,6 +11,7 @@ var _weapons: OptionButton
 var _type: OptionButton
 var _mode: OptionButton
 var _color: ColorPickerButton
+var _ammo_type: LineEdit
 var fields: Dictionary = {}
 var _refreshing := false
 var _status: Label
@@ -24,6 +25,7 @@ var _heat := 0.0
 var _cooldown := 0.0
 var _sequence := 0
 const GROUPS := {
+"Патроны": [["magazine_size","Ёмкость магазина"],["reserve_ammo","Начальный запас патронов"],["reload_time","Время перезарядки, с"]],
 "Баллистика": [
 ["rpm","Темп, выстрелов/мин"],["damage","Урон пули / дробины"],["max_range","Дальность, м"],["falloff_start","Начало падения урона, м"],["minimum_damage","Доля урона вдали"],["arm_multiplier","Множитель урона рукам"],["leg_multiplier","Множитель урона ногам"],["pellets","Дробин в выстреле"],
 ["hip_spread","Разброс от бедра, °"],["aim_spread","Разброс в прицеле, °"],["movement_multiplier","Разброс в движении, ×"],["crouch_multiplier","Разброс в приседе, ×"],["prone_multiplier","Разброс лёжа, ×"],["air_multiplier","Разброс в воздухе, ×"],["bloom_per_shot","Добавка разброса за выстрел, °"],["bloom_max","Максимальная добавка, °"],["bloom_recovery","Восстановление точности, °/с"]],
@@ -71,16 +73,20 @@ func _ready() -> void:
 	for group in GROUPS:
 		var scroll := ScrollContainer.new(); scroll.name=group; scroll.horizontal_scroll_mode=ScrollContainer.SCROLL_MODE_DISABLED; tabs.add_child(scroll)
 		var box := VBoxContainer.new(); box.size_flags_horizontal=Control.SIZE_EXPAND_FILL; scroll.add_child(box)
-		if group=="Баллистика":
+		if group=="Патроны":
 			_mode=OptionButton.new(); _mode.add_item("Одиночный огонь"); _mode.add_item("Автоматический огонь"); box.add_child(_mode)
 			_mode.item_selected.connect(func(i): edited.emit(settings(),"fire_mode",i))
+			var label := Label.new(); label.text="Тип патронов / калибр"; box.add_child(label)
+			_ammo_type=LineEdit.new(); _ammo_type.max_length=64; box.add_child(_ammo_type)
+			_ammo_type.text_changed.connect(func(value):
+				if not _refreshing: edited.emit(settings(),"ammo_type",value))
 		for item in GROUPS[group]:
 			var line := HBoxContainer.new(); box.add_child(line)
 			var label := Label.new(); label.text=item[1]; label.size_flags_horizontal=Control.SIZE_EXPAND_FILL; line.add_child(label)
 			var spin := SpinBox.new(); spin.custom_minimum_size.x=105
 			var limits: Vector2=DGDFirearmSettings.LIMITS[item[0]]
 			spin.min_value=limits.x; spin.max_value=limits.y
-			spin.step=1 if item[0] in ["rpm","damage","pellets","smoke_amount","max_range","falloff_start"] else (0.001 if item[0]=="weapon_kickback" else 0.01)
+			spin.step=1 if item[0] in ["rpm","damage","pellets","smoke_amount","max_range","falloff_start","magazine_size","reserve_ammo"] else (0.001 if item[0]=="weapon_kickback" else 0.01)
 			spin.value_changed.connect(change.bind(item[0])); line.add_child(spin); fields[item[0]]=spin
 		if group=="Огонь и дым":
 			_color=ColorPickerButton.new(); _color.text="Цвет вспышки"; box.add_child(_color)
@@ -92,7 +98,7 @@ func button(parent: Node,title: String,callback: Callable) -> Button:
 func checkbox(parent: Node,title: String,callback: Callable) -> CheckBox:
 	var b:=CheckBox.new(); b.text=title; b.toggled.connect(callback); parent.add_child(b); return b
 func change(value: float,key: String) -> void:
-	if not _refreshing: edited.emit(settings(),key,int(value) if key in ["pellets","smoke_amount"] else value)
+	if not _refreshing: edited.emit(settings(),key,int(value) if key in ["pellets","smoke_amount","magazine_size","reserve_ammo"] else value)
 func refresh() -> void:
 	if not preview: return
 	_refreshing=true
@@ -101,6 +107,7 @@ func refresh() -> void:
 	_weapons.select(selected)
 	_type.select(settings().weapon_type); _mode.select(settings().fire_mode)
 	_color.color=settings().flash_color
+	if _ammo_type.text != settings().ammo_type: _ammo_type.text=settings().ammo_type
 	for key in fields: fields[key].set_value_no_signal(settings().value(key))
 	fields.pellets.editable=settings().weapon_type==3
 	if preview.profile != profile(): preview.set_profile(profile())

@@ -20,6 +20,7 @@ var _status_label: Label
 var _room_input: LineEdit
 var _hud: Control
 var _injury_panel: Control
+var _combat_panel: VBoxContainer
 var _hp_label: Label
 var _weapon_label: Label
 var _stats_label: Label
@@ -240,10 +241,15 @@ func _build_ui() -> void:
 	_injury_panel.offset_bottom = 112
 	MatchServer.local_injuries_changed.connect(_injury_panel.set_injuries)
 
-	_hp_label = Label.new()
-	_hp_label.position = Vector2(132, 12)
-	_hp_label.add_theme_font_size_override("font_size", 22)
-	_hud.add_child(_hp_label)
+	_combat_panel = preload("res://ui/combat_panel.gd").new()
+	_hud.add_child(_combat_panel)
+	_combat_panel.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_RIGHT)
+	_combat_panel.offset_left = -260
+	_combat_panel.offset_right = -20
+	_combat_panel.offset_top = -128
+	_combat_panel.offset_bottom = -20
+	_hp_label = _combat_panel.hp_label
+	MatchServer.local_ammo_changed.connect(_combat_panel.set_ammo)
 
 	_weapon_label = Label.new()
 	_weapon_label.position = Vector2(132, 44)
@@ -288,6 +294,8 @@ func _build_ui() -> void:
 ## MatchServer is an autoload that outlives this scene: drop our listeners so a
 ## scene reload can't leave callables into freed labels hanging on its signals.
 func _exit_tree() -> void:
+	if is_instance_valid(_combat_panel) and MatchServer.local_ammo_changed.is_connected(_combat_panel.set_ammo):
+		MatchServer.local_ammo_changed.disconnect(_combat_panel.set_ammo)
 	if is_instance_valid(_injury_panel) and MatchServer.local_injuries_changed.is_connected(_injury_panel.set_injuries):
 		MatchServer.local_injuries_changed.disconnect(_injury_panel.set_injuries)
 	if MatchServer.local_status_changed.is_connected(_on_local_status_changed):
@@ -342,7 +350,7 @@ func _process(delta: float) -> void:
 
 
 func _on_local_hp_changed(hp: int) -> void:
-	_hp_label.text = "HP %d" % hp if hp > 0 else "DEAD - respawn in %ds" % int(NetConfig.RESPAWN_DELAY_SEC)
+	_combat_panel.set_hp(hp)
 
 
 ## Diagnostic/testing convenience: `godot ... -- --room=SOMECODE` overrides the

@@ -1,7 +1,7 @@
 # Network foundation
 
 The simulation uses Godot 4.7.2 and the repository's native Photon Fusion SDK.
-The wire version is `dgd-net-6`; peers with the old schema join a different
+The wire version is `dgd-net-7`; peers with the old schema join a different
 Photon application-version namespace and cannot accidentally mix packets.
 
 ## State and input
@@ -10,7 +10,7 @@ Photon application-version namespace and cannot accidentally mix packets.
   movement, view angles, flags, requested stance/equipment and life id.
 - `player/player.tscn` declares persistent replicated properties **before spawn**:
   HP, life id, respawn deadline, stance, weapon, aim, pitch and shot sequencing /
-  cooldown, the injury bit mask, and the selected weapon profile id, and firing bloom/value timestamp. Fusion's `REPLICATION_AUTO` supplies transform and velocity.
+  cooldown, the injury bit mask, and the selected weapon profile id, and firing bloom/value timestamp. The static `WeaponAmmo` child also declares magazine, reserve, reload deadline, active profile, stowed inventory, processed-shot watermark and reload nonce. Fusion's `REPLICATION_AUTO` supplies transform and velocity.
 - The input owner predicts locally. The master executes the same decoded input.
   Queued input from a previous life is rejected after a respawn teleport.
 - Local mouse intent is independent of simulated angles: replay never overwrites
@@ -236,3 +236,25 @@ per volley before damage, so a lethal early pellet cannot erase later pellets'
 hit shapes. The single-hit codec is retained for existing visual tests. Recoil is
 local presentation outside prediction replay; the subsequent sent aim ray includes
 its visible camera offset. See `addons/dgd_firearm/README.md` for controls/limits.
+
+
+## Ammunition and reload
+
+`net/weapon_ammo.gd` owns ammunition state separately from movement simulation.
+The host consumes one cartridge per accepted volley, validates reload eligibility,
+and completes the transfer at the shared-clock deadline outside input replay.
+Every otherwise valid shot sequence is acknowledged even when ammo, reload or
+cadence rejects it, allowing the owner to reconcile its immediate HUD decrement.
+Reload requests carry an increasing nonce, life and profile; duplicates do not
+restart the deadline. Only master-authenticated results affect local prediction.
+Death, holstering and profile changes cancel reload without spending reserve.
+Respawn resets the inventory. Stowed magazines and caliber pools are archived
+only on weapon changes; active shots replicate small scalar changes. Both the
+archive and timer survive late join and authority migration.
+
+Regression commands:
+
+```sh
+python3 tests/run_ammo.py /absolute/path/to/godot
+python3 tests/run_ammo.py /absolute/path/to/godot ammo_migration_peer
+```

@@ -12,6 +12,7 @@ extends Node
 signal hit_reported(shooter_id: int, target_id: int, hit_bone: String, position: Vector3)
 ## Emitted on every peer whenever the LOCAL player's hp changes (HUD hook).
 signal local_hp_changed(hp: int)
+signal local_ammo_changed(state: Dictionary)
 signal local_injuries_changed(parts: int, hp: int)
 ## Local player's weapon / view / aim summary line for the HUD.
 signal local_status_changed(text: String)
@@ -148,6 +149,9 @@ func _physics_process(_delta: float) -> void:
 	if not Fusion.is_in_room() or not Fusion.is_master_client():
 		_shots.clear()
 		return
+	var now := float(Fusion.get_network_time())
+	for player in _players.values():
+		if is_instance_valid(player): player.server_tick_ammo(now)
 	var pending := _shots
 	_shots = []
 	for shot in pending:

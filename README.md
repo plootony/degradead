@@ -25,7 +25,7 @@ The Fusion addon is a plain GDExtension: it loads automatically from `addons/fus
 
 In the editor: **Debug → Run Multiple Instances → 2 Instances**, then `F5`. Press **Join** in both windows with the same room code.
 
-Controls: `WASD` move, mouse look, **click** to capture the mouse, **Esc** to release it (needed to click into the other window), **LMB** to fire (only while the mouse is captured and the rifle is in hand), **RMB (hold)** aim, **Shift (hold)** sprint, **Space** jump, **C** toggle crouch, **Z** toggle prone (from either stand or crouch; pressing it again while prone stands back up), **F** melee (rifle butt, visual only -- no damage), **V** toggle first / third person, **Q** switch weapon (rifle ⇄ hands, the rifle goes on the back), **1** / **2** pick the slot directly.
+Controls: `WASD` move, mouse look, **click** to capture the mouse, **Esc** to release it (needed to click into the other window), **LMB** to fire (only while the mouse is captured and the rifle is in hand), **R** reload, **RMB (hold)** aim, **Shift (hold)** sprint, **Space** jump, **C** toggle crouch, **Z** toggle prone (from either stand or crouch; pressing it again while prone stands back up), **F** melee (rifle butt, visual only -- no damage), **V** toggle first / third person, **Q** switch weapon (rifle ⇄ hands, the rifle goes on the back), **1** / **2** pick the slot directly.
 
 Camera is DayZ-like: third person sits behind and over the right shoulder with the character low-centre; aiming pulls in tight over the shoulder and narrows the FOV; first person is at the eyes with the body and rifle rendered. The torso bends with the vertical look angle (a `SkeletonModifier3D` on top of the animation), so the rifle follows your aim in every view.
 
@@ -43,3 +43,8 @@ Run two instances with the same `--room` and compare their logs: `[POS ...]` lin
 - **Region**: `fusion/connection/default_region` is set to `eu`. This Fusion 3 preview App ID only exposes five Photon regions — `us`, `eu`, `asia`, `jp`, `sa`; `ru`/`rue`/`tr` and the rest return `Region X is not available (32756)`. Measured from Russia on 2026-09-07: eu ≈149 ms, us ≈209 ms, asia ≈289 ms, sa ≈354 ms, jp ≈379 ms. A per-run override is `Fusion.connect_to_photon(user_id, region, app_version)`.
 - `project.godot` pins the Windows rendering driver to **D3D12**. On a machine without D3D12 support, change `rendering/rendering_device/driver.windows` to `vulkan`.
 - Hit detection is **lag-compensated in both hitbox modes** (the master rewinds each target to what the shooter was looking at, using the shooter's own RTT). `NetConfig.HITBOX_MODE` only picks the shapes: `"single"` (default, one capsule per player) or `"modular"` (one sphere per bone, head = 100 damage). `NetConfig.LAG_COMPENSATION = false` resolves against current positions instead, to A/B the difference.
+
+
+Ammo capacity, starting reserve, caliber, reload duration and single/automatic
+fire are configured in **Стрельба → Патроны** for each weapon. Bottom-right HUD
+shows numeric HP and magazine / reserve. See `addons/dgd_firearm/README.md`.

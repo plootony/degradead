@@ -6,6 +6,9 @@ func check(ok: bool, label: String):
 	if not ok: failures += 1
 	print("[INJURY] ", label, " ", "PASS" if ok else "FAIL")
 func run():
+	var reload_key := InputEventKey.new()
+	reload_key.physical_keycode=KEY_R; reload_key.pressed=true; reload_key.device=0
+	check(reload_key.is_action_pressed("reload"),"physical_r_reload_binding")
 	var config = root.get_node("NetConfig")
 	var server = root.get_node("MatchServer")
 	var scene = load("res://net/lobby.tscn").instantiate()
@@ -53,9 +56,17 @@ func run():
 	check(panel._parts.head.modulate == panel.HEALTHY, "hud_respawn_reset")
 	server.local_injuries_changed.emit(4 | 32, 55)
 	scene._on_local_hp_changed(55)
+	server.local_ammo_changed.emit({"magazine":7,"reserve":23,"type":"5.45×39","armed":true})
+	check(scene._hp_label.text=="HP 55" and scene._combat_panel.ammo_label.text=="7 / 23","numeric_hp_and_ammo")
+	server.local_ammo_changed.emit({"magazine":7,"reserve":23,"type":"5.45×39","armed":true,"reloading":true,"seconds":2})
+	check(scene._combat_panel.detail_label.text.contains("Перезарядка"),"reload_hud")
+	server.local_ammo_changed.emit({"magazine":7,"reserve":23,"type":"5.45×39","armed":true})
 	await process_frame
 	await process_frame
 	check(scene._hud.get_global_rect().encloses(panel.get_global_rect()), "hud_within_viewport")
+	var combat:Rect2=scene._combat_panel.get_global_rect()
+	var viewport:Rect2=scene._hud.get_global_rect()
+	check(viewport.encloses(combat) and absf(viewport.end.x-combat.end.x-20)<1 and absf(viewport.end.y-combat.end.y-20)<1,"combat_bottom_right")
 	if "--visual" in OS.get_cmdline_user_args():
 		await create_timer(0.4).timeout
 		await RenderingServer.frame_post_draw

@@ -304,6 +304,9 @@ var _last_input_motion := Vector3.ZERO
 var _view_snap_pending: bool = true
 
 
+var _ammo: DGDWeaponAmmo
+var _reload_visual_active := false
+
 func _ready() -> void:
 	add_to_group("players")
 	_build_movement_collision()
@@ -336,6 +339,8 @@ func _ready() -> void:
 	_hitbox_history.setup(self)
 	add_child(_hitbox_history)
 
+	_ammo = get_node("WeaponAmmo")
+	_ammo.bind_player(self)
 	_refresh_registration()
 	_sync_presentation()
 
@@ -430,7 +435,9 @@ func _apply_weapon_profile() -> void:
 
 func server_set_weapon_profile(id: String) -> bool:
 	if not Fusion.is_master_client() or not weapon_library.find_profile(id): return false
+	if id == _weapon_profile_id: return true
 	_weapon_profile_id = id
+	_ammo.select_profile()
 	_shot_heat = 0.0
 	_sync_presentation()
 	return true
@@ -740,6 +747,8 @@ func _unhandled_input(event: InputEvent) -> void:
 	elif event.is_action_pressed("fire"):
 		_auto_trigger = true
 		_try_fire()
+	elif event.is_action_pressed("reload"):
+		_request_reload()
 	elif event.is_action_pressed("jump"):
 		_jump_pending = true
 	elif event.is_action_pressed("toggle_view"):
@@ -775,6 +784,7 @@ func set_aiming(aiming: bool) -> void:
 func _request_weapon_slot(slot: int) -> void:
 	if _hp > 0 and slot >= 0 and slot < WeaponSlot.size():
 		_wanted_weapon = slot
+		if slot != WeaponSlot.RIFLE and _ammo: _ammo.cancel_prediction()
 
 
 func _request_stance(new_stance: int) -> void:
@@ -1005,6 +1015,10 @@ func _sync_presentation() -> void:
 		_observed_aim = _aiming
 		_emit_local_status()
 
+	if _ammo:
+		_ammo.sync_view()
+		_sync_reload_animation()
+
 
 func get_firing_settings() -> DGDFirearmSettings:
 	var p := weapon_library.find_profile(_weapon_profile_id)
@@ -1020,6 +1034,7 @@ func _try_fire() -> void:
 	var now := Time.get_ticks_msec() / 1000.0
 	if not _camera or _hp <= 0 or _wanted_weapon != WeaponSlot.RIFLE or _weapon_slot != WeaponSlot.RIFLE or now < _local_next_fire_at or _current_clip in ["reload","rifle_pull_out","rifle_put_away","melee"]:
 		return
+	if not _ammo or _ammo.is_reloading() or _ammo.predicted_magazine() <= 0: return
 	var p := get_firing_settings()
 	# Preserve cadence across frame rounding; skip backlog after a long stall.
 	_local_next_fire_at = now+p.interval() if now-_local_next_fire_at>p.interval() else _local_next_fire_at+p.interval()
@@ -1032,6 +1047,7 @@ func _try_fire() -> void:
 	var seed_value := DGDBallistics.shot_seed(get_player_id(),_life_id,_shot_sequence)
 	var rays := DGDBallistics.directions(-_camera.global_basis.z,angle,p.pellet_count(),seed_value)
 	MatchServer.predict_shot(self, _shot_sequence, _life_id, _camera.global_position, -_camera.global_basis.z, get_muzzle_position(),rays,p.value("max_range"))
+	_ammo.predict_shot(_shot_sequence)
 	_send_fire_request()
 	_local_heat = minf(p.value("bloom_max"),_local_heat+p.value("bloom_per_shot"))
 	_local_heat_at = now
@@ -1091,6 +1107,10 @@ func _update_animation(delta: float) -> void:
 	_leg_tuck_amount = move_toward(_leg_tuck_amount, 1.0 if airborne else 0.0, JUMP_TUCK_BLEND_SPEED * delta)
 	if _leg_tuck_modifier:
 		_leg_tuck_modifier.tuck = _leg_tuck_amount
+
+	if _ammo and _ammo.is_reloading():
+		_sync_reload_animation()
+		return
 
 	if _current_clip in ACTION_CLIPS and _anim_player.is_playing():
 		return  # let a one-shot action (fire/reload/melee/stance change...) finish
@@ -1247,11 +1267,13 @@ func _send_fire_request() -> void:
 func rpc_request_fire(sequence: int, life_id: int, origin: Vector3, direction: Vector3, shooter_rtt: float, muzzle: Vector3, profile_id: String = "") -> void:
 	if not Fusion.is_master_client() or not _rpc_sender_is(get_player_id()):
 		return
-	if (not profile_id.is_empty() and profile_id != _weapon_profile_id) or life_id != _life_id or _hp <= 0 or _weapon_slot != WeaponSlot.RIFLE:
+	if (not profile_id.is_empty() and profile_id != _weapon_profile_id) or life_id != _life_id:
 		return
 	if sequence <= _last_shot_sequence or sequence > 0x7fffffff or not origin.is_finite() or not muzzle.is_finite() or not direction.is_finite() or not is_finite(shooter_rtt):
 		return
 	var now := float(Fusion.get_network_time())
+	if not _ammo.receive_shot(sequence, now): return
+	if _hp <= 0 or _weapon_slot != WeaponSlot.RIFLE: return
 	var p := get_firing_settings()
 	# Allow one batched arrival (at most 100 ms), retaining cadence debt.
 	if now + minf(p.interval(),0.1) < _next_fire_at or direction.length_squared() < 0.9 or direction.length_squared() > 1.1:
@@ -1266,6 +1288,7 @@ func rpc_request_fire(sequence: int, life_id: int, origin: Vector3, direction: V
 	var rays := DGDBallistics.directions(direction,angle,p.pellet_count(),DGDBallistics.shot_seed(get_player_id(),life_id,sequence))
 	_shot_heat = minf(p.value("bloom_max"),_shot_heat+p.value("bloom_per_shot"))
 	_shot_heat_at = now
+	_ammo.consume_shot()
 	MatchServer.queue_shot(self, origin, direction.normalized(), shooter_rtt, life_id, sequence, muzzle,rays,p,_weapon_profile_id)
 
 
@@ -1289,6 +1312,7 @@ func server_apply_damage(damage: int, hitbox_key: String = "body") -> int:
 	# A head hit is lethal independently of the weapon damage or current HP.
 	_hp = 0 if hitbox_key == "head" else maxi(0, _hp - damage)
 	if _hp == 0:
+		_ammo.reload_until = 0.0
 		_respawn_at = float(Fusion.get_network_time()) + NetConfig.RESPAWN_DELAY_SEC
 	return _hp
 
@@ -1297,6 +1321,7 @@ func broadcast_respawn(spawn_pos: Vector3) -> void:
 	if not Fusion.is_master_client():
 		return
 	_life_id += 1
+	_ammo.reset_life()
 	_shot_heat = 0.0
 	_shot_heat_at = 0.0
 	_hp = NetConfig.MAX_HP
@@ -1393,3 +1418,50 @@ func get_weapon_slot() -> int:
 
 func get_hitbox_history() -> HitboxHistory:
 	return _hitbox_history
+
+
+func _request_reload() -> void:
+	if not _has_input_authority() or not Fusion.is_in_room() or _hp <= 0 or not _ammo: return
+	if _weapon_slot != WeaponSlot.RIFLE or _wanted_weapon != WeaponSlot.RIFLE: return
+	if _ammo.is_reloading() or _ammo.reserve <= 0 or _ammo.predicted_magazine() >= int(get_firing_settings().value("magazine_size")): return
+	if _current_clip in ["rifle_pull_out","rifle_put_away","melee"]: return
+	var nonce := _ammo.predict_reload()
+	_sync_reload_animation()
+	Fusion.rpc_to(NetConfig.RPC_TARGET_MASTER, rpc_request_reload, nonce, _life_id, _weapon_profile_id)
+
+
+@rpc("any_peer", "reliable")
+func rpc_request_reload(nonce: int, life: int, profile: String) -> void:
+	if not Fusion.is_master_client() or not _rpc_sender_is(get_player_id()): return
+	if life != _life_id or profile != _weapon_profile_id or nonce <= 0 or nonce > 0x7fffffff: return
+	_ammo.start_reload(float(Fusion.get_network_time()), nonce)
+	# Duplicate requests report the existing deadline without restarting it.
+	Fusion.rpc(Callable(self,"rpc_reload_result"), nonce, life, _ammo.reload_until)
+
+
+@rpc("any_peer", "call_local", "reliable")
+func rpc_reload_result(nonce: int, life: int, deadline: float) -> void:
+	if not _rpc_from_master() or not _has_input_authority() or life != _life_id: return
+	_ammo.reload_result(nonce,deadline)
+	_sync_reload_animation()
+
+
+func _sync_reload_animation() -> void:
+	if not _anim_player: return
+	if _ammo.is_reloading():
+		if _current_clip != "reload" or not _reload_visual_active:
+			var clip := _anim_player.get_animation("reload")
+			if clip:
+				var duration := get_firing_settings().value("reload_time")
+				_play_action("reload",clip.length/duration)
+				_anim_player.seek(clampf(1.0-(_ammo.reload_deadline()-float(Fusion.get_network_time()))/duration,0.0,1.0)*clip.length,true)
+		_reload_visual_active = true
+	elif _reload_visual_active:
+		_reload_visual_active = false
+		if _current_clip == "reload":
+			_anim_player.stop()
+			_current_clip = ""
+
+
+func server_tick_ammo(now: float) -> void:
+	if _ammo: _ammo.server_tick(now)

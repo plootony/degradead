@@ -23,6 +23,20 @@ func run(plugin: EditorPlugin) -> void:
 	var saved=ResourceLoader.load(plugin.PATH,"",ResourceLoader.CACHE_MODE_IGNORE_DEEP)
 	check(saved.default_profile().firing.damage==damage+1,"save_reload")
 	history.undo();plugin.save()
+	var capacity:int=old.magazine_size
+	var caliber:String=old.ammo_type
+	var mode:int=old.fire_mode
+	ui.fields.magazine_size.value=capacity+1
+	ui._ammo_type.text="9×19 тест"
+	ui._ammo_type.text_changed.emit(ui._ammo_type.text)
+	ui._mode.item_selected.emit(1-mode)
+	check(old.magazine_size==capacity+1 and old.ammo_type=="9×19 тест" and old.fire_mode==1-mode,"ammo_controls")
+	plugin.save()
+	saved=ResourceLoader.load(plugin.PATH,"",ResourceLoader.CACHE_MODE_IGNORE_DEEP)
+	check(saved.default_profile().firing.magazine_size==capacity+1 and saved.default_profile().firing.ammo_type=="9×19 тест" and saved.default_profile().firing.fire_mode==1-mode,"ammo_save_reload")
+	for i in 3: history.undo()
+	plugin.save()
+	check(old.magazine_size==capacity and old.ammo_type==caliber and old.fire_mode==mode,"ammo_undo")
 	plugin.preset(3)
 	check(ui.settings().pellet_count()==8,"shotgun_preset")
 	for i in 20: await plugin.get_tree().process_frame
