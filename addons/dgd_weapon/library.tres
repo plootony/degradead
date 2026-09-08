@@ -1,0 +1,52 @@
+[gd_resource type="Resource" script_class="DGDWeaponLibrary" format=3 uid="uid://gq2blnxedb6o"]
+
+[ext_resource type="Script" uid="uid://cfgn0u7vsdwo8" path="res://addons/dgd_weapon/library.gd" id="1"]
+[ext_resource type="Script" uid="uid://dmoy7rwldvgfw" path="res://addons/dgd_weapon/profile.gd" id="2"]
+[ext_resource type="PackedScene" uid="uid://jewsjqi53bt4" path="res://player/weapon/aks74.fbx" id="2_ax3bw"]
+[ext_resource type="Script" uid="uid://c6aoi7sulqlov" path="res://addons/dgd_weapon/pose.gd" id="3_uwfjm"]
+
+[sub_resource type="Resource" id="Resource_ew18p"]
+script = ExtResource("3_uwfjm")
+position = Vector3(-1.4901161e-08, 1.1920929e-07, 3.1664968e-08)
+rotation_degrees = Vector3(1.4941041e-06, -1.4471527e-13, -1.2806603e-06)
+
+[sub_resource type="Resource" id="Resource_bsurb"]
+script = ExtResource("3_uwfjm")
+position = Vector3(-0.10941836, -0.12552369, -0.06316447)
+rotation_degrees = Vector3(0.77990675, 68.97674, -24.655476)
+
+[sub_resource type="Resource" id="Resource_wwwcq"]
+script = ExtResource("3_uwfjm")
+position = Vector3(-0.24078444, 0.47074828, -0.045150965)
+rotation_degrees = Vector3(11.947212, 107.302086, 51.391933)
+
+[sub_resource type="Resource" id="Resource_f2tyy"]
+script = ExtResource("3_uwfjm")
+position = Vector3(-0.10307753, -0.13466042, -0.19226962)
+rotation_degrees = Vector3(-3.6121645, 69.056915, -37.13056)
+
+[sub_resource type="Resource" id="Resource_sis1j"]
+script = ExtResource("3_uwfjm")
+position = Vector3(-0.024638236, -0.15924549, -0.009739757)
+rotation_degrees = Vector3(0.9551003, 68.61504, -24.872736)
+
+[sub_resource type="Resource" id="Resource_1w1dx"]
+script = ExtResource("3_uwfjm")
+position = Vector3(-0.012916923, -0.0957472, -0.036769032)
+rotation_degrees = Vector3(0.9551003, 68.61504, -24.872736)
+
+[sub_resource type="Resource" id="AKS74"]
+script = ExtResource("2")
+hidden_nodes = PackedStringArray("54539", "54539 case", "ak74 30rnd empty bakelite mag")
+mount_position = Vector3(0.21137917, 0.007875562, 0.0614153)
+mount_rotation = Vector3(58.97853, -135.60966, 144.76534)
+right_position = Vector3(-0.15784022, -0.07183468, 0.014533386)
+right_rotation = Vector3(0, 180, 90)
+left_position = Vector3(0.16601026, -0.01718843, 0.018135719)
+left_rotation = Vector3(-90, -90, 0)
+holster_rotation = Vector3(27.000656, 90, 90)
+poses = Array[ExtResource("3_uwfjm")]([SubResource("Resource_ew18p"), SubResource("Resource_bsurb"), SubResource("Resource_wwwcq"), SubResource("Resource_f2tyy"), SubResource("Resource_sis1j"), SubResource("Resource_1w1dx")])
+
+[resource]
+script = ExtResource("1")
+profiles = Array[ExtResource("2")]([SubResource("AKS74")])

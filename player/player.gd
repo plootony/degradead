@@ -9,6 +9,7 @@ class_name Player
 ## a Skeleton3D/AnimationPlayer by type, instead of hardcoding a guessed NodePath.
 
 signal hp_changed(hp: int)
+signal visual_pose_updated
 
 const MOVE_SPEED: float = 4.5
 const GRAVITY: float = 9.8
@@ -171,7 +172,11 @@ const HITBOX_BONES: Dictionary = {
 }
 
 @export var model_scene: PackedScene = preload("res://player/model/tony.fbx")
-@export var weapon_scene: PackedScene = preload("res://player/weapon/aks74.fbx")
+@export var weapon_library: DGDWeaponLibrary = preload("res://addons/dgd_weapon/library.tres")
+const WEAPON_MODIFIER = preload("res://addons/dgd_weapon/modifier.gd")
+var _weapon_modifier: DGDWeaponModifier
+var _weapon_profile_id: String = ""
+var _observed_weapon_profile: String = ""
 @export var dying_clip: PackedScene = preload("res://player/animations/dying.fbx")
 
 ## Standing locomotion.
@@ -234,7 +239,6 @@ var _hitbox_history: HitboxHistory
 ## HITBOX_BONES bone name -> skeleton bone index, resolved once in _ready().
 var _hitbox_bone_indices: Dictionary = {}
 var _weapon_attachment: Node3D
-var _weapon_back_attachment: Node3D
 var _weapon: Node3D
 var _muzzle: Marker3D
 var _spring_arm: SpringArm3D
@@ -299,9 +303,15 @@ func _ready() -> void:
 	_build_model_and_skeleton()
 	_build_spine_modifier()
 	_build_leg_tuck_modifier()
+	if _weapon_modifier:
+		_skeleton.move_child(_weapon_modifier, _skeleton.get_child_count() - 1)
 	_build_camera_rig()
 	_build_replicator()
 	_merge_animation_clips()
+	if _anim_player:
+		_anim_player.callback_mode_process = AnimationMixer.ANIMATION_CALLBACK_MODE_PROCESS_MANUAL
+	if _skeleton:
+		_skeleton.modifier_callback_mode_process = Skeleton3D.MODIFIER_CALLBACK_MODE_PROCESS_MANUAL
 
 	if _skeleton:
 		for bone_name: String in HITBOX_BONES.keys():
@@ -313,8 +323,7 @@ func _ready() -> void:
 				var end_idx := _skeleton.find_bone(end_name)
 				if end_idx != -1:
 					_hitbox_bone_indices[end_name] = end_idx
-	# Added AFTER everything that moves this node so its _physics_process runs
-	# after ours each tick and records that tick's final position.
+	# Record from visual_pose_updated, after the final skeleton modifier.
 	_hitbox_history = HitboxHistory.new()
 	_hitbox_history.name = "HitboxHistory"
 	_hitbox_history.setup(self)
@@ -384,121 +393,49 @@ func _build_model_and_skeleton() -> void:
 
 
 func _attach_weapon() -> void:
-	var bone_idx := _skeleton.find_bone(WEAPON_HAND_BONE)
-	if bone_idx == -1:
-		push_warning("Player: bone '%s' not found on skeleton -- weapon not attached." % WEAPON_HAND_BONE)
-		return
-	var attachment := BoneAttachment3D.new()
-	attachment.name = "WeaponAttachment"
-	attachment.bone_name = WEAPON_HAND_BONE
-	_skeleton.add_child(attachment)
-	var weapon := weapon_scene.instantiate() as Node3D
-	_strip_weapon_extras(weapon)
-	_normalize_weapon_scale(weapon)
-	# Orient the rifle in the hand-bone frame. Mixamo hand bones: +Y runs
-	# wrist -> knuckles, +Z is the palm normal, +X the thumb-side axis. The rifle
-	# mesh points its barrel down +X with +Y up (grip at WEAPON_GRIP_LOCAL), so
-	# barrel := along the fingers, up := thumb axis, rifle-left := into the palm.
-	_weapon = weapon
-	# The imported compensator's +X face is the muzzle, not the hand bone.
-	var tip := weapon.get_node_or_null("aks74 compensator") as MeshInstance3D
-	if tip:
-		_muzzle = Marker3D.new()
-		_muzzle.name = "Muzzle"
-		var bounds := tip.get_aabb()
-		_muzzle.position = Vector3(bounds.end.x, bounds.get_center().y, bounds.get_center().z)
-		tip.add_child(_muzzle)
-	_weapon_attachment = attachment
-	# Holster slot: rifle slung diagonally across the back (Spine2 bone).
-	var back := BoneAttachment3D.new()
-	back.name = "WeaponBackAttachment"
-	back.bone_name = WEAPON_BACK_BONE
-	_skeleton.add_child(back)
-	_weapon_back_attachment = back
+	_weapon_modifier = WEAPON_MODIFIER.new()
+	_weapon_modifier.name = "WeaponIK"
+	_skeleton.add_child(_weapon_modifier)
+	_weapon_modifier.modification_processed.connect(func(): visual_pose_updated.emit())
+	if _weapon_profile_id.is_empty():
+		_weapon_profile_id = weapon_library.default_id
+	_apply_weapon_profile()
+
+
+func _apply_weapon_profile() -> void:
+	if not _weapon_modifier: return
+	var profile := weapon_library.find_profile(_weapon_profile_id)
+	if not profile: profile = weapon_library.default_profile()
+	if not profile: return
+	_weapon_modifier.profile = profile
+	_weapon_modifier.rebuild()
+	_weapon = _weapon_modifier.model
+	_weapon_attachment = _weapon_modifier.weapon_root
+	_muzzle = _weapon_modifier.muzzle
+	_observed_weapon_profile = _weapon_profile_id
 	_apply_weapon_slot()
 
 
-## Places the rifle on the hand or the back according to _weapon_slot.
+func server_set_weapon_profile(id: String) -> bool:
+	if not Fusion.is_master_client() or not weapon_library.find_profile(id): return false
+	_weapon_profile_id = id
+	_sync_presentation()
+	return true
+
+
 func _apply_weapon_slot() -> void:
-	if not _weapon:
-		return
-	var s: float = _weapon.scale.x  # uniform, set by _normalize_weapon_scale
-	var target: Node3D = _weapon_attachment if _weapon_slot == WeaponSlot.RIFLE else _weapon_back_attachment
-	if _weapon.get_parent() != target:
-		if _weapon.get_parent():
-			_weapon.get_parent().remove_child(_weapon)
-		target.add_child(_weapon)
-	if _weapon_slot == WeaponSlot.RIFLE:
-		_weapon.basis = WEAPON_IN_HAND_BASIS * s
-		_weapon.position = -(WEAPON_IN_HAND_BASIS * (WEAPON_GRIP_LOCAL * s)) + WEAPON_PALM_OFFSET
-	else:
-		_weapon.basis = WEAPON_ON_BACK_BASIS * s
-		_weapon.position = WEAPON_ON_BACK_OFFSET
+	if _weapon_modifier:
+		_weapon_modifier.equipped = _weapon_slot == WeaponSlot.RIFLE
 
 
-## Extra props that ship inside aks74.fbx lying next to the rifle (a loose
-## cartridge, its empty case and a spare magazine). They are not part of the
-## weapon; the inserted "ak74 30rnd bakelite mag" stays.
-const WEAPON_EXTRA_NODE_NAMES: Array[String] = ["54539", "54539 case", "ak74 30rnd empty bakelite mag"]
-## Rifle-local (unscaled) point in the middle of the pistol grip.
-const WEAPON_GRIP_LOCAL: Vector3 = Vector3(-0.93, -1.0, 0.0)
-## Rifle axes expressed in hand-bone space: rifle +X (barrel) -> bone +Y,
-## rifle +Y (up) -> bone +X, rifle +Z (right side) -> bone -Z.
-const WEAPON_IN_HAND_BASIS: Basis = Basis(Vector3(0, 1, 0), Vector3(1, 0, 0), Vector3(0, 0, -1))
-## Bone-space nudge so the grip sits inside the closed fist rather than at the wrist.
-const WEAPON_PALM_OFFSET: Vector3 = Vector3(0.0, 0.08, 0.03)
-## Holstered pose in the Spine2 bone frame (+Y up the spine, +Z model-forward,
-## i.e. out of the chest): barrel up-and-left across the back, behind the body.
-## Rifle top faces the body (+Z) so the magazine sticks outward, not into the back.
-const WEAPON_ON_BACK_BASIS: Basis = Basis(Vector3(0.454, 0.891, 0.0), Vector3(0.0, 0.0, 1.0), Vector3(0.891, -0.454, 0.0))
-const WEAPON_ON_BACK_OFFSET: Vector3 = Vector3(0.0, 0.0, -0.2)
-
-func _strip_weapon_extras(weapon: Node) -> void:
-	for child in weapon.get_children():
-		if String(child.name) in WEAPON_EXTRA_NODE_NAMES:
-			weapon.remove_child(child)
-			child.queue_free()
-
-
-## aks74.fbx renders many meters long at scale 1.0 -- almost certainly a
-## unit mismatch baked into that export (a common issue when an asset comes
-## from a different pack than the character). Rather than guess a fixed
-## divisor blindly, measure the model's actual longest dimension and scale it
-## to a plausible real-world rifle length.
-const WEAPON_TARGET_LENGTH: float = 0.9
-
-func _normalize_weapon_scale(weapon: Node3D) -> void:
-	var aabb := _local_aabb(weapon, Transform3D.IDENTITY)
-	var longest: float = max(aabb.size.x, max(aabb.size.y, aabb.size.z))
-	if longest <= 0.001:
-		return
-	var factor := WEAPON_TARGET_LENGTH / longest
-	if absf(factor - 1.0) > 0.05:
-		weapon.scale = Vector3.ONE * factor
-		print("[Player diag] weapon longest dimension=%.3f at scale 1.0 -> auto-scaled by %.5f (target %.2fm)" % [longest, factor, WEAPON_TARGET_LENGTH])
-
-
-## Accumulates the AABB of every VisualInstance3D under `node`, expressed in
-## `node`'s own local space (composing local `transform`s down the subtree --
-## works before the node is added to the tree, unlike global_transform).
-static func _local_aabb(node: Node, xform: Transform3D) -> AABB:
-	var result := AABB()
-	var has_any := false
-	if node is VisualInstance3D:
-		var mesh_aabb: AABB = node.get_aabb()
-		for i in range(8):
-			var p := xform * mesh_aabb.get_endpoint(i)
-			result = AABB(p, Vector3.ZERO) if not has_any else result.expand(p)
-			has_any = true
-	for child in node.get_children():
-		if child is Node3D:
-			var child_aabb := _local_aabb(child, xform * child.transform)
-			if has_any:
-				result = result.merge(child_aabb)
-			else:
-				result = child_aabb
-			has_any = true
-	return result
+func _advance_visual_pose(delta: float) -> void:
+	if _spine_modifier:
+		_spine_modifier.pitch = 0.0 if _dead else (_look_pitch if _has_input_authority() else _pitch)
+	if _weapon_modifier:
+		_weapon_modifier.state = _stance * 2 + (1 if _aiming else 0)
+		_weapon_modifier.allow_ik = _hp > 0 and _current_clip not in ["reload", "melee", "rifle_pull_out", "rifle_put_away"]
+	if _anim_player: _anim_player.advance(delta)
+	if _skeleton: _skeleton.advance(delta)
 
 
 func _build_camera_rig() -> void:
@@ -642,7 +579,7 @@ func get_hitbox_shapes() -> Array:
 			var end: Vector3 = frame.origin
 			var end_name: String = info.get("end", "")
 			if _hitbox_bone_indices.has(end_name):
-				end = _skeleton.global_transform * _skeleton.get_bone_global_pose(_hitbox_bone_indices[end_name]).origin
+				end = _skeleton.global_transform * _visual_bone_frame(_hitbox_bone_indices[end_name]).origin
 			shapes.append({"key": info["key"], "a": frame.origin, "b": end, "r": info["radius"], "frame": frame})
 		return shapes
 	var xf := global_transform
@@ -661,11 +598,17 @@ func get_hitbox_shapes() -> Array:
 	return shapes
 
 
+func _visual_bone_frame(index: int) -> Transform3D:
+	if _weapon_modifier and _weapon_modifier.final_frames.has(index):
+		return _weapon_modifier.final_frames[index]
+	return _skeleton.get_bone_global_pose(index)
+
+
 func get_hitbox_frame(key: String) -> Transform3D:
 	if key != "body" and _skeleton:
 		for bone_name in HITBOX_BONES:
 			if _hitbox_bone_indices.has(bone_name) and HITBOX_BONES[bone_name]["key"] == key:
-				return _skeleton.global_transform * _skeleton.get_bone_global_pose(_hitbox_bone_indices[bone_name])
+				return _skeleton.global_transform * _visual_bone_frame(_hitbox_bone_indices[bone_name])
 	return global_transform
 
 
@@ -740,50 +683,7 @@ func _merge_animation_clips() -> void:
 
 
 func _merge_clip_into(target_lib: AnimationLibrary, scene: PackedScene, new_name: String, looping: bool) -> void:
-	if target_lib.has_animation(new_name) or not scene:
-		return
-	var temp := scene.instantiate()
-	var src_player := _find_child_of_type(temp, AnimationPlayer) as AnimationPlayer
-	if src_player:
-		for lib_name in src_player.get_animation_library_list():
-			var src_lib := src_player.get_animation_library(lib_name)
-			for anim_name in src_lib.get_animation_list():
-				# Duplicate: the imported resource is shared between all Player
-				# instances and we are about to edit its tracks.
-				var anim: Animation = src_lib.get_animation(anim_name).duplicate()
-				# Mixamo exports come in with loop_mode = NONE, so a run cycle
-				# played once (0.5 s) and then froze mid-stride.
-				anim.loop_mode = Animation.LOOP_LINEAR if looping else Animation.LOOP_NONE
-				# Applied unconditionally, not just to loops: a one-shot with
-				# baked-in hip travel (a turn, Stand Up, a jump...) would drag
-				# the mesh away from the physics-driven capsule for the clip's
-				# duration too -- same class of bug this was written to fix for
-				# the run cycles in the first place.
-				_bake_in_place(anim)
-				target_lib.add_animation(new_name, anim)
-				break  # each Mixamo "without skin" export has exactly one clip
-			if target_lib.has_animation(new_name):
-				break
-	temp.free()
-
-
-## Strips horizontal root motion from the hips position track. "Run Backward"
-## was exported WITHOUT "In Place": its hips travel ~2.5 m per cycle, which
-## dragged the mesh away from the collider/camera and snapped it back every
-## loop -- the visible "camera breaks while running" bug.
-func _bake_in_place(anim: Animation) -> void:
-	for t in range(anim.get_track_count()):
-		if anim.track_get_type(t) != Animation.TYPE_POSITION_3D:
-			continue
-		if not String(anim.track_get_path(t)).ends_with(HIPS_BONE):
-			continue
-		var key_count := anim.track_get_key_count(t)
-		if key_count == 0:
-			continue
-		var first: Vector3 = anim.track_get_key_value(t, 0)
-		for k in range(key_count):
-			var v: Vector3 = anim.track_get_key_value(t, k)
-			anim.track_set_key_value(t, k, Vector3(first.x, v.y, first.z))
+	DGDWeaponAssets.merge_clip(target_lib, scene, new_name, looping)
 
 
 static func _find_child_of_type(root: Node, type) -> Node:
@@ -945,7 +845,7 @@ const STANCE_STATUS_SUFFIX: Dictionary = {Stance.CROUCH: "   CROUCH [C]", Stance
 func _emit_local_status() -> void:
 	if MatchServer and _has_input_authority():
 		MatchServer.local_status_changed.emit("%s [Q]   %s [V]%s%s" % [
-			WEAPON_SLOT_NAMES[_weapon_slot],
+			_weapon_modifier.profile.title if _weapon_slot == WeaponSlot.RIFLE and _weapon_modifier and _weapon_modifier.profile else WEAPON_SLOT_NAMES[_weapon_slot],
 			"1st person" if _view == View.FIRST_PERSON else "3rd person",
 			"   AIM" if _aiming else "",
 			STANCE_STATUS_SUFFIX.get(_stance, ""),
@@ -999,6 +899,7 @@ func _physics_process(delta: float) -> void:
 		_update_view_correction()
 		_camera_advance_velocity = Vector3.ZERO if test_move(global_transform, velocity * delta) else velocity
 	_update_animation(delta)
+	_advance_visual_pose(delta)
 
 
 func _update_view_correction() -> void:
@@ -1024,6 +925,9 @@ func _refresh_registration() -> void:
 
 
 func _sync_presentation() -> void:
+	if _weapon_modifier and _observed_weapon_profile != _weapon_profile_id:
+		_apply_weapon_profile()
+		_emit_local_status()
 	var new_life := _life_id != _observed_life_id
 	if new_life:
 		if _camera_rig:

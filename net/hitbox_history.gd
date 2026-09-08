@@ -9,10 +9,17 @@ var _count: int = 0
 
 func setup(source: Node) -> void:
 	_source = source
+	if source.has_signal("visual_pose_updated"):
+		source.connect("visual_pose_updated", _record_pose)
 	process_physics_priority = 10000
 	_buffer.resize(ceili(NetConfig.HITBOX_HISTORY_SEC * Engine.physics_ticks_per_second) + 2)
 
 func _physics_process(_delta: float) -> void:
+	if is_instance_valid(_source) and _source.has_signal("visual_pose_updated"):
+		return
+	_record_pose()
+
+func _record_pose() -> void:
 	if not is_instance_valid(_source) or not Fusion.is_in_room() or not Fusion.is_master_client():
 		return
 	record(Time.get_ticks_msec() / 1000.0, _source.call("get_hitbox_shapes"))

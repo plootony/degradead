@@ -1,7 +1,7 @@
 # Network foundation
 
 The simulation uses Godot 4.7.2 and the repository's native Photon Fusion SDK.
-The wire version is `dgd-net-4`; peers with the old schema join a different
+The wire version is `dgd-net-5`; peers with the old schema join a different
 Photon application-version namespace and cannot accidentally mix packets.
 
 ## State and input
@@ -10,7 +10,7 @@ Photon application-version namespace and cannot accidentally mix packets.
   movement, view angles, flags, requested stance/equipment and life id.
 - `player/player.tscn` declares persistent replicated properties **before spawn**:
   HP, life id, respawn deadline, stance, weapon, aim, pitch and shot sequencing /
-  cooldown, plus the injury bit mask. Fusion's `REPLICATION_AUTO` supplies transform and velocity.
+  cooldown, the injury bit mask, and the selected weapon profile id. Fusion's `REPLICATION_AUTO` supplies transform and velocity.
 - The input owner predicts locally. The master executes the same decoded input.
   Queued input from a previous life is rejected after a respawn teleport.
 - Local mouse intent is independent of simulated angles: replay never overwrites
@@ -31,7 +31,7 @@ The predicted tracer is clipped against visible hitboxes and geometry during the
 next physics tick (at most one tick later), without waiting for the server. The host
 validates the native sender against the receiving avatar, life id, increasing
 sequence, cooldown, finite unit ray and bounded camera origin. Unknown senders
-are rejected. Physics queries run after movement/history in the physics tick.
+are rejected. Physics queries run after movement and use the latest completed visual-pose history.
 Both the camera ray and the path from the player's eye to the result are checked
 against cover. This is bounded server validation, not a complete anti-cheat.
 
@@ -187,3 +187,33 @@ Only a local player's confirmed HP decrease triggers hit shake; replay of input
 and remote shot animations do not. Impulses reset on a new life. No new network
 messages or replicated properties are introduced. See the plugin README for
 parameters, editor workflow and its runtime/editor/network tests.
+
+
+## Weapon profiles and IK
+
+`addons/dgd_weapon` adds a main editor screen named **Оружие IK**. Each weapon
+profile contains a model, two grip transforms, elbow offsets, muzzle and holster
+transforms, and six stance/aim adjustments. See its README for the workflow.
+`server_set_weapon_profile(id)` validates the catalogue id on the master;
+`_weapon_profile_id` is durable snapshot state. All peers must ship the same
+catalogue. Bone rotations are computed locally and are not sent over the wire.
+
+The AnimationPlayer and Skeleton3D advance manually once per visual physics
+update. Spine/jump modifiers run before the final weapon modifier. The weapon
+references the original animated right hand, avoiding a cyclic IK dependency.
+Its two arm solvers preserve bone lengths and blend their influence off during
+reload, melee, equip/holster and death. This does not author finger animations.
+
+Godot restores base bone poses after its modifier pass. The final modifier's
+`modification_processed` signal caches bone transforms in skeleton coordinates;
+modular hitboxes and blood reprojection read this cache. The same signal records
+hit history on the master. This captures the completed visual pose, rather than
+reading the restored base animation later from another physics callback.
+
+```sh
+python3 tests/run_weapon.py /absolute/path/to/godot
+```
+
+This checks six poses, stable paused IK, unreachable targets, length preservation,
+release/restore, final hitbox frames, editor drag/save/undo, profile replication,
+client authority rejection, and two-client torso/headshot effects and respawn.

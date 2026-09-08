@@ -27,7 +27,7 @@ func run():
 	settings.first_person.height -= 0.1
 	var save_error := ResourceSaver.save(settings, "/tmp/dgd-camera-roundtrip.tres")
 	var restored = ResourceLoader.load("/tmp/dgd-camera-roundtrip.tres", "", ResourceLoader.CACHE_MODE_IGNORE)
-	check(save_error == OK and restored.third_person.distance == 3.0 and restored.first_person.fov == 80.0, "resource_roundtrip")
+	check(save_error == OK and is_equal_approx(restored.third_person.distance, settings.third_person.distance) and is_equal_approx(restored.first_person.fov, settings.first_person.fov), "resource_roundtrip")
 	var p = settings.first_person.duplicate()
 	p.step_amplitude = 0.0
 	p.shot_amplitude = 0.0
