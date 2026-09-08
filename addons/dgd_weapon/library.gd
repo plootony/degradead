@@ -17,6 +17,7 @@ func validation_error() -> String:
 	for profile in profiles:
 		if not profile: return "В каталоге есть пустой профиль."
 		if profile.id.strip_edges().is_empty(): return "Идентификатор оружия не должен быть пустым."
+		if profile.id.to_utf8_buffer().size()>96: return "Идентификатор оружия слишком длинный: " + profile.title
 		if ids.has(profile.id): return "Повторяющийся идентификатор: " + profile.id
 		ids[profile.id] = true
 		if not profile.model: return "У профиля нет модели: " + profile.title

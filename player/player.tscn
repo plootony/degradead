@@ -3,7 +3,7 @@
 [ext_resource type="Script" path="res://player/player.gd" id="1"]
 
 [sub_resource type="FusionReplicationConfig" id="ReplicationState"]
-property_count = 11
+property_count = 13
 properties/0/path = NodePath(":_hp")
 properties/1/path = NodePath(":_life_id")
 properties/2/path = NodePath(":_respawn_at")
@@ -15,6 +15,8 @@ properties/7/path = NodePath(":_last_shot_sequence")
 properties/8/path = NodePath(":_next_fire_at")
 properties/9/path = NodePath(":_injured_parts")
 properties/10/path = NodePath(":_weapon_profile_id")
+properties/11/path = NodePath(":_shot_heat")
+properties/12/path = NodePath(":_shot_heat_at")
 
 [node name="Player" type="CharacterBody3D"]
 script = ExtResource("1")

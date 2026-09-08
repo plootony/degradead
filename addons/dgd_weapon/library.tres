@@ -3,7 +3,11 @@
 [ext_resource type="Script" uid="uid://cfgn0u7vsdwo8" path="res://addons/dgd_weapon/library.gd" id="1"]
 [ext_resource type="Script" uid="uid://dmoy7rwldvgfw" path="res://addons/dgd_weapon/profile.gd" id="2"]
 [ext_resource type="PackedScene" uid="uid://jewsjqi53bt4" path="res://player/weapon/aks74.fbx" id="2_ax3bw"]
+[ext_resource type="Script" uid="uid://b2h63qrfu2agj" path="res://addons/dgd_firearm/settings.gd" id="2_uwfjm"]
 [ext_resource type="Script" uid="uid://c6aoi7sulqlov" path="res://addons/dgd_weapon/pose.gd" id="3_uwfjm"]
+
+[sub_resource type="Resource" id="Resource_loe2m"]
+script = ExtResource("2_uwfjm")
 
 [sub_resource type="Resource" id="Resource_ew18p"]
 script = ExtResource("3_uwfjm")
@@ -37,6 +41,7 @@ rotation_degrees = Vector3(0.9551003, 68.61504, -24.872736)
 
 [sub_resource type="Resource" id="AKS74"]
 script = ExtResource("2")
+firing = SubResource("Resource_loe2m")
 hidden_nodes = PackedStringArray("54539", "54539 case", "ak74 30rnd empty bakelite mag")
 mount_position = Vector3(0.21137917, 0.007875562, 0.0614153)
 mount_rotation = Vector3(58.97853, -135.60966, 144.76534)

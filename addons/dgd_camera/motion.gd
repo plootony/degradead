@@ -22,6 +22,11 @@ func fire(profile: DGDCameraProfile) -> void:
 	_shot_duration = profile.value("shot_duration")
 	_shot_strength = deg_to_rad(profile.value("shot_amplitude"))
 
+func fire_custom(amplitude: float, duration: float) -> void:
+	_shot_age = 0.0
+	_shot_duration = maxf(0.02,duration)
+	_shot_strength = deg_to_rad(maxf(0,amplitude))
+
 func hit(profile: DGDCameraProfile) -> void:
 	_hit_age = 0.0
 	_hit_duration = profile.value("hit_duration")

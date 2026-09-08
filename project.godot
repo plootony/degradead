@@ -27,7 +27,7 @@ window/stretch/aspect="expand"
 
 [editor_plugins]
 
-enabled=PackedStringArray("res://addons/dgd_camera/plugin.cfg", "res://addons/dgd_weapon/plugin.cfg")
+enabled=PackedStringArray("res://addons/dgd_camera/plugin.cfg", "res://addons/dgd_weapon/plugin.cfg", "res://addons/dgd_firearm/plugin.cfg")
 
 [fusion]
 

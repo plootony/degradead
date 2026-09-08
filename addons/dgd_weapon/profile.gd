@@ -4,6 +4,7 @@ class_name DGDWeaponProfile
 const POSE = preload("res://addons/dgd_weapon/pose.gd")
 const STATES: Array[String] = ["Стоя", "Стоя — прицел", "Присед", "Присед — прицел", "Лёжа", "Лёжа — прицел"]
 const HAND_BASIS := Basis(Vector3(0, 1, 0), Vector3(1, 0, 0), Vector3(0, 0, -1))
+@export var firing: DGDFirearmSettings = preload("res://addons/dgd_firearm/settings.gd").new()
 @export var id := "aks74"
 @export var title := "AKS-74"
 @export var model: PackedScene = preload("res://player/weapon/aks74.fbx")

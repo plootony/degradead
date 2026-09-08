@@ -175,6 +175,13 @@ const HITBOX_BONES: Dictionary = {
 @export var weapon_library: DGDWeaponLibrary = preload("res://addons/dgd_weapon/library.tres")
 const WEAPON_MODIFIER = preload("res://addons/dgd_weapon/modifier.gd")
 var _weapon_modifier: DGDWeaponModifier
+var _muzzle_effect: DGDMuzzleEffect
+var _firearm_motion := preload("res://addons/dgd_firearm/motion.gd").new()
+var _shot_heat := 0.0
+var _shot_heat_at := 0.0
+var _auto_trigger := false
+var _local_heat := 0.0
+var _local_heat_at := 0.0
 var _weapon_profile_id: String = ""
 var _observed_weapon_profile: String = ""
 @export var dying_clip: PackedScene = preload("res://player/animations/dying.fbx")
@@ -412,6 +419,11 @@ func _apply_weapon_profile() -> void:
 	_weapon = _weapon_modifier.model
 	_weapon_attachment = _weapon_modifier.weapon_root
 	_muzzle = _weapon_modifier.muzzle
+	_firearm_motion.reset()
+	_local_heat = 0.0
+	if not _muzzle_effect:
+		_muzzle_effect = preload("res://addons/dgd_firearm/muzzle_effect.gd").new()
+		_muzzle.add_child(_muzzle_effect)
 	_observed_weapon_profile = _weapon_profile_id
 	_apply_weapon_slot()
 
@@ -419,6 +431,7 @@ func _apply_weapon_profile() -> void:
 func server_set_weapon_profile(id: String) -> bool:
 	if not Fusion.is_master_client() or not weapon_library.find_profile(id): return false
 	_weapon_profile_id = id
+	_shot_heat = 0.0
 	_sync_presentation()
 	return true
 
@@ -461,6 +474,9 @@ func _update_camera(delta: float) -> void:
 		return
 	_camera_rig.configure(_camera_profile(), STANCE_PIVOT_Y[_stance], delta,
 		Vector2(velocity.x, velocity.z).length(), absf(velocity.y) < 0.05, _hp > 0)
+	var firing := get_firing_settings()
+	_firearm_motion.advance(delta,firing)
+	_camera.rotation += _firearm_motion.camera_angles
 	_update_view_transform()
 
 
@@ -559,6 +575,8 @@ func _process(delta: float) -> void:
 	if _has_input_authority():
 		_view_correction *= exp(-delta / NetConfig.OWNER_CORRECTION_DECAY_SEC)
 		_update_camera(delta)
+		if Fusion.is_in_room():
+			_update_automatic_fire(Input.is_action_pressed("fire"),Input.mouse_mode == Input.MOUSE_MODE_CAPTURED)
 	if _spine_modifier:
 		_spine_modifier.pitch = 0.0 if _dead else (_look_pitch if _has_input_authority() else _pitch)
 
@@ -703,7 +721,10 @@ static func _find_child_of_type(root: Node, type) -> Node:
 func _unhandled_input(event: InputEvent) -> void:
 	if not _has_input_authority() or not Fusion.is_in_room():
 		return
+	if event.is_action_released("fire"):
+		_auto_trigger = false
 	if event.is_action_pressed("ui_cancel"):
+		_auto_trigger = false
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 		_jump_pending = false
 		return
@@ -717,6 +738,7 @@ func _unhandled_input(event: InputEvent) -> void:
 		_look_pitch = clampf(_look_pitch - event.screen_relative.y * MOUSE_SENSITIVITY, PITCH_MIN, PITCH_MAX)
 		_update_view_transform()
 	elif event.is_action_pressed("fire"):
+		_auto_trigger = true
 		_try_fire()
 	elif event.is_action_pressed("jump"):
 		_jump_pending = true
@@ -930,6 +952,11 @@ func _sync_presentation() -> void:
 		_emit_local_status()
 	var new_life := _life_id != _observed_life_id
 	if new_life:
+		_firearm_motion.reset()
+		_local_heat = 0.0
+		_local_next_fire_at = 0.0
+		if _weapon_modifier: _weapon_modifier.shot_motion.reset()
+		if _muzzle_effect: _muzzle_effect.reset()
 		if _camera_rig:
 			_camera_rig.reset()
 		_observed_life_id = _life_id
@@ -979,22 +1006,49 @@ func _sync_presentation() -> void:
 		_emit_local_status()
 
 
+func get_firing_settings() -> DGDFirearmSettings:
+	var p := weapon_library.find_profile(_weapon_profile_id)
+	if not p: p = weapon_library.default_profile()
+	if p.firing == null: p.firing = DGDFirearmSettings.new()
+	return p.firing
+
+func _update_automatic_fire(trigger_held: bool, captured: bool) -> void:
+	if _auto_trigger and trigger_held and captured and get_firing_settings().fire_mode == 1:
+		_try_fire()
+
 func _try_fire() -> void:
 	var now := Time.get_ticks_msec() / 1000.0
-	if not _camera or _hp <= 0 or _wanted_weapon != WeaponSlot.RIFLE or _weapon_slot != WeaponSlot.RIFLE or now < _local_next_fire_at:
+	if not _camera or _hp <= 0 or _wanted_weapon != WeaponSlot.RIFLE or _weapon_slot != WeaponSlot.RIFLE or now < _local_next_fire_at or _current_clip in ["reload","rifle_pull_out","rifle_put_away","melee"]:
 		return
-	_local_next_fire_at = now + NetConfig.FIRE_INTERVAL_SEC
+	var p := get_firing_settings()
+	# Preserve cadence across frame rounding; skip backlog after a long stall.
+	_local_next_fire_at = now+p.interval() if now-_local_next_fire_at>p.interval() else _local_next_fire_at+p.interval()
 	_shot_sequence = maxi(_shot_sequence, _last_shot_sequence) + 1
 	_fire_pending = true
 	_update_view_transform()
 	_play_fire_clip()
-	# No physics-space query in the mouse callback; the authoritative impact
-	# is resolved during the physics tick.
-	MatchServer.predict_shot(self, _shot_sequence, _life_id, _camera.global_position, -_camera.global_basis.z, get_muzzle_position())
+	_local_heat = DGDBallistics.cool(p,_local_heat,now-_local_heat_at)
+	var angle := DGDBallistics.spread(p,_aiming,_stance,Vector2(velocity.x,velocity.z).length(),absf(velocity.y)>0.1,_local_heat)
+	var seed_value := DGDBallistics.shot_seed(get_player_id(),_life_id,_shot_sequence)
+	var rays := DGDBallistics.directions(-_camera.global_basis.z,angle,p.pellet_count(),seed_value)
+	MatchServer.predict_shot(self, _shot_sequence, _life_id, _camera.global_position, -_camera.global_basis.z, get_muzzle_position(),rays,p.value("max_range"))
 	_send_fire_request()
-	# Start the kick after capturing the shot ray; it never alters stored input.
-	if _camera_rig:
-		_camera_rig.motion.fire(_camera_profile())
+	_local_heat = minf(p.value("bloom_max"),_local_heat+p.value("bloom_per_shot"))
+	_local_heat_at = now
+	play_shot_effects(_shot_sequence,_life_id,_weapon_profile_id,true)
+
+func play_shot_effects(sequence: int, life: int, profile_id: String, local: bool = false) -> void:
+	if life != _life_id or profile_id != _weapon_profile_id: return
+	var p := get_firing_settings()
+	var seed_value := DGDBallistics.shot_seed(get_player_id(),life,sequence)
+	_weapon_modifier.shot_motion.fire(p,seed_value,_aiming)
+	if _muzzle_effect: _muzzle_effect.fire(p)
+	if local:
+		var previous := _firearm_motion.camera_angles
+		_firearm_motion.fire(p,seed_value,_aiming)
+		# Capture the ray before recoil. The next shot uses the visibly recoiled aim.
+		_camera.rotation += _firearm_motion.camera_angles-previous
+		_camera_rig.motion.fire_custom(p.value("camera_shake")*_camera_profile().value("shot_amplitude"),p.value("shake_duration"))
 
 
 func _has_input_authority() -> bool:
@@ -1184,29 +1238,40 @@ func _send_fire_request() -> void:
 	# what THIS peer was actually looking at -- see MatchServer._rewind_for().
 	Fusion.rpc_to(
 		NetConfig.RPC_TARGET_MASTER, rpc_request_fire,
-		_shot_sequence, _life_id, origin, direction, float(Fusion.get_rtt()), get_muzzle_position()
+		_shot_sequence, _life_id, origin, direction, float(Fusion.get_rtt()), get_muzzle_position(), _weapon_profile_id
 	)
 
 
 ## Client -> master. Identity comes from the RPC context and this network object.
 @rpc("any_peer", "reliable")
-func rpc_request_fire(sequence: int, life_id: int, origin: Vector3, direction: Vector3, shooter_rtt: float, muzzle: Vector3) -> void:
+func rpc_request_fire(sequence: int, life_id: int, origin: Vector3, direction: Vector3, shooter_rtt: float, muzzle: Vector3, profile_id: String = "") -> void:
 	if not Fusion.is_master_client() or not _rpc_sender_is(get_player_id()):
 		return
-	if life_id != _life_id or _hp <= 0 or _weapon_slot != WeaponSlot.RIFLE:
+	if (not profile_id.is_empty() and profile_id != _weapon_profile_id) or life_id != _life_id or _hp <= 0 or _weapon_slot != WeaponSlot.RIFLE:
 		return
-	if sequence <= _last_shot_sequence or not origin.is_finite() or not muzzle.is_finite() or not direction.is_finite() or not is_finite(shooter_rtt):
+	if sequence <= _last_shot_sequence or sequence > 0x7fffffff or not origin.is_finite() or not muzzle.is_finite() or not direction.is_finite() or not is_finite(shooter_rtt):
 		return
 	var now := float(Fusion.get_network_time())
-	if now < _next_fire_at or direction.length_squared() < 0.9 or direction.length_squared() > 1.1:
+	var p := get_firing_settings()
+	# Allow one batched arrival (at most 100 ms), retaining cadence debt.
+	if now + minf(p.interval(),0.1) < _next_fire_at or direction.length_squared() < 0.9 or direction.length_squared() > 1.1:
 		return
 	var allowance := NetConfig.MAX_CAMERA_ORIGIN_DISTANCE + SPRINT_SPEED * clampf(shooter_rtt, 0.0, NetConfig.MAX_REWIND_SEC)
 	if origin.distance_to(global_position) > allowance or muzzle.distance_to(global_position) > allowance:
 		return
 	_last_shot_sequence = sequence
-	_next_fire_at = now + NetConfig.FIRE_INTERVAL_SEC
-	# Resolve in physics, not inside a network/render callback.
-	MatchServer.queue_shot(self, origin, direction.normalized(), shooter_rtt, life_id, sequence, muzzle)
+	_next_fire_at = maxf(now,_next_fire_at) + p.interval()
+	_shot_heat = DGDBallistics.cool(p,_shot_heat,now-_shot_heat_at)
+	var angle := DGDBallistics.spread(p,_aiming,_stance,Vector2(velocity.x,velocity.z).length(),absf(velocity.y)>0.1,_shot_heat)
+	var rays := DGDBallistics.directions(direction,angle,p.pellet_count(),DGDBallistics.shot_seed(get_player_id(),life_id,sequence))
+	_shot_heat = minf(p.value("bloom_max"),_shot_heat+p.value("bloom_per_shot"))
+	_shot_heat_at = now
+	MatchServer.queue_shot(self, origin, direction.normalized(), shooter_rtt, life_id, sequence, muzzle,rays,p,_weapon_profile_id)
+
+
+@rpc("any_peer", "call_local", "reliable")
+func rpc_report_volley(payload: PackedByteArray) -> void:
+	if _rpc_from_master(): MatchServer.report_volley(get_player_id(),payload)
 
 
 @rpc("any_peer", "call_local", "reliable")
@@ -1232,6 +1297,8 @@ func broadcast_respawn(spawn_pos: Vector3) -> void:
 	if not Fusion.is_master_client():
 		return
 	_life_id += 1
+	_shot_heat = 0.0
+	_shot_heat_at = 0.0
 	_hp = NetConfig.MAX_HP
 	_injured_parts = 0
 	_respawn_at = 0.0
@@ -1257,6 +1324,8 @@ func apply_hit_result(hp_left: int, _position: Vector3, hit_bone: String = "") -
 
 func _die(hit_bone: String = "") -> void:
 	_dead = true
+	_firearm_motion.reset()
+	if _weapon_modifier: _weapon_modifier.shot_motion.reset()
 	# Deterministic per-peer pick so every peer renders the same clip from only
 	# data already in the broadcast hit report (no extra RPC field needed):
 	# DEATH_CLIP_BY_HITBOX for the killing hitbox, else alternate between the

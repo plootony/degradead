@@ -3,6 +3,7 @@ extends SkeletonModifier3D
 class_name DGDWeaponModifier
 const ASSETS = preload("res://addons/dgd_weapon/assets.gd")
 const SOLVER = preload("res://addons/dgd_weapon/arm_solver.gd")
+var shot_motion := preload("res://addons/dgd_firearm/motion.gd").new()
 var profile: DGDWeaponProfile
 var state := 0
 var equipped := true
@@ -46,6 +47,7 @@ func rebuild() -> void:
 	model = ASSETS.instantiate_weapon(profile)
 	weapon_root.add_child(model)
 	_profile_ref = profile
+	shot_motion.reset()
 	_weight = 0.0
 	_pose_transform = Transform3D.IDENTITY
 	_bone_version = -1
@@ -83,6 +85,9 @@ func _process_modification_with_delta(delta: float) -> void:
 	var mount := animated_hand * profile.transform_at(profile.mount_position, profile.mount_rotation) * _pose_transform
 	if not equipped and _back >= 0:
 		mount = s.get_bone_global_pose(_back) * profile.transform_at(profile.holster_position, profile.holster_rotation)
+	if profile.firing:
+		shot_motion.advance(delta,profile.firing)
+		if equipped: mount *= shot_motion.weapon_transform(profile.firing,profile.transform_at(Vector3.ZERO,profile.muzzle_rotation).basis)
 	weapon_root.transform = mount
 	muzzle.transform = profile.transform_at(profile.muzzle_position, profile.muzzle_rotation)
 	var right_goal := mount * profile.transform_at(profile.right_position, profile.right_rotation)

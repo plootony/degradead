@@ -52,6 +52,7 @@ func register_player(player: Node) -> void:
 		if _players[known_id] == player and known_id != id:
 			_players.erase(known_id)
 	_players[id] = player
+	_ensure_vfx_pools.call_deferred()
 
 
 func unregister_player(player: Node) -> void:
@@ -105,16 +106,16 @@ func reset_session() -> void:
 	_next_spawn_index = 0
 
 
-func queue_shot(shooter: Node, origin: Vector3, direction: Vector3, rtt: float, life_id: int, sequence: int, muzzle: Vector3) -> void:
+func queue_shot(shooter: Node, origin: Vector3, direction: Vector3, rtt: float, life_id: int, sequence: int, muzzle: Vector3, rays: Array[Vector3] = [], firing: DGDFirearmSettings = null, profile_id: String = "") -> void:
 	_shots.append({"shooter": weakref(shooter), "origin": origin, "direction": direction,
-		"rtt": rtt, "life": life_id, "sequence": sequence, "muzzle": muzzle, "received_at": Time.get_ticks_msec() / 1000.0})
+		"rtt": rtt, "life": life_id, "sequence": sequence, "muzzle": muzzle, "received_at": Time.get_ticks_msec() / 1000.0,"rays":rays,"firing":firing,"profile_id":profile_id})
 
 
-func predict_shot(shooter: Node, sequence: int, life: int, origin: Vector3, direction: Vector3, muzzle: Vector3) -> void:
+func predict_shot(shooter: Node, sequence: int, life: int, origin: Vector3, direction: Vector3, muzzle: Vector3, rays: Array[Vector3] = [], max_range: float = 100.0) -> void:
 	# The input event sends its RPC immediately; the visual query waits at most
 	# one physics tick, where space queries are safe. Never draw an unclipped ray.
 	_predictions.append({"shooter": weakref(shooter), "sequence": sequence, "life": life,
-		"origin": origin, "direction": direction, "muzzle": muzzle})
+		"origin": origin, "direction": direction, "muzzle": muzzle,"rays":rays,"range":max_range})
 
 
 func _draw_predictions() -> void:
@@ -125,12 +126,18 @@ func _draw_predictions() -> void:
 		if not is_instance_valid(shooter) or shooter.get("_life_id") != shot["life"]:
 			continue
 		var id: int = shooter.call("get_player_id")
-		var key := ShotVisuals.shot_key(id, shot["life"], shot["sequence"])
-		var result := trace_shot(id, shot["origin"], shot["direction"], shot["muzzle"], -1.0)
-		var tracer := draw_tracer(shot["muzzle"], shot.get("confirmed_end", result["position"]))
-		if tracer:
-			tracer.set_meta("shot_key", key)
-			_predicted_tracers[key] = {"node": weakref(tracer), "expires": Time.get_ticks_msec() + 2000}
+		var rays: Array = shot.rays if not shot.rays.is_empty() else [shot.direction]
+		var shapes := _collect_shot_shapes(-1.0)
+		for i in rays.size():
+			var key := _pellet_key(id,shot.life,shot.sequence,i)
+			var result := trace_shot(id,shot.origin,rays[i],shot.muzzle,-1.0,shot.range,shapes)
+			var confirmed: Dictionary = shot.get("confirmed_ends",{})
+			var end: Vector3 = confirmed.get(i,shot.get("confirmed_end",result.position))
+			var tracer := draw_tracer(shot.muzzle,end)
+			if tracer:
+				tracer.set_meta("shot_key",key)
+				_predicted_tracers[key]={"node":weakref(tracer),"expires":Time.get_ticks_msec()+2000}
+
 
 
 func _physics_process(_delta: float) -> void:
@@ -148,9 +155,15 @@ func _physics_process(_delta: float) -> void:
 		if not shooter or shooter.get("_life_id") != shot["life"] or shooter.call("is_dead"):
 			continue
 		var id: int = shooter.call("get_player_id")
-		var result := resolve_shot(id, shot["origin"], shot["direction"], shot["rtt"], shot["received_at"], shot["muzzle"])
-		var visuals := ShotVisuals.encode(shot["sequence"], shot["life"], result["target_life"], shot["muzzle"], result["contact"], result["normal"])
-		Fusion.rpc(Callable(shooter, "rpc_report_hit"), id, result["target_id"], result["hit_bone"], result["position"], result["hp_left"], visuals)
+		if shot.firing:
+			var results := resolve_volley(id,shot.origin,shot.rays,shot.rtt,shot.received_at,shot.muzzle,shot.firing)
+			var payload := ShotBatch.encode(shot.sequence,shot.life,shot.muzzle,shot.profile_id,results)
+			Fusion.rpc(Callable(shooter,"rpc_report_volley"),payload)
+		else:
+			var result := resolve_shot(id, shot.origin, shot.direction, shot.rtt, shot.received_at, shot.muzzle)
+			var visuals := ShotVisuals.encode(shot.sequence,shot.life,result.target_life,shot.muzzle,result.contact,result.normal)
+			Fusion.rpc(Callable(shooter,"rpc_report_hit"),id,result.target_id,result.hit_bone,result.position,result.hp_left,visuals)
+
 	_poll_respawns()
 
 
@@ -175,16 +188,41 @@ func resolve_shot(shooter_id: int, origin: Vector3, direction: Vector3, shooter_
 	return result
 
 
+func resolve_volley(shooter_id: int, origin: Vector3, rays: Array, rtt: float, received_at: float, muzzle: Vector3, firing: DGDFirearmSettings) -> Array:
+	var results: Array = []
+	var target_time := received_at-_rewind_for(shooter_id,rtt)
+	var cached_shapes := _collect_shot_shapes(target_time)
+	# Query all pellets before applying damage: death must not erase the target
+	# halfway through this single trigger's history sample.
+	for ray in rays.slice(0,32):
+		results.append(trace_shot(shooter_id,origin,ray,muzzle,target_time,firing.value("max_range"),cached_shapes))
+	for hit in results:
+		var target := get_player(hit.target_id)
+		if target:
+			hit.hp_left=target.call("server_apply_damage",DGDBallistics.damage_at(firing,origin.distance_to(hit.position),hit.hit_bone),hit.hit_bone)
+	return results
+
+
+func _collect_shot_shapes(target_time: float) -> Dictionary:
+	var result: Dictionary = {}
+	for id in _players.keys():
+		var player := get_player(id)
+		if not player: continue
+		var history: HitboxHistory = player.call("get_hitbox_history")
+		if history: result[id] = player.call("get_hitbox_shapes") if target_time<0 else history.sample_at(target_time)
+	return result
+
+
 ## Read-only query shared by prediction and authoritative resolution. A negative
 ## sample time uses currently displayed shapes; prediction never applies damage.
-func trace_shot(shooter_id: int, origin: Vector3, direction: Vector3, muzzle: Vector3, target_time: float) -> Dictionary:
+func trace_shot(shooter_id: int, origin: Vector3, direction: Vector3, muzzle: Vector3, target_time: float, max_range: float = NetConfig.MAX_SHOT_RANGE, cached_shapes: Dictionary = {}) -> Dictionary:
 	var dir := direction.normalized()
 
 	# Level geometry occludes: nothing further than the first wall counts.
-	var best_dist := NetConfig.MAX_SHOT_RANGE
+	var best_dist := clampf(max_range,1,500)
 	var result := {"target_id": -1, "hit_bone": "", "position": origin + dir * best_dist, "hp_left": -1, "target_life": -1, "contact": Vector3.ZERO, "normal": -dir}
 	var space_state := get_tree().root.get_world_3d().direct_space_state
-	var query := PhysicsRayQueryParameters3D.create(origin, origin + dir * NetConfig.MAX_SHOT_RANGE)
+	var query := PhysicsRayQueryParameters3D.create(origin, origin + dir * best_dist)
 	query.collision_mask = NetConfig.layer_mask(NetConfig.ENVIRONMENT_LAYER_BIT)
 	query.collide_with_areas = false
 	var shooter := get_player(shooter_id)
@@ -217,7 +255,9 @@ func trace_shot(shooter_id: int, origin: Vector3, direction: Vector3, muzzle: Ve
 		var history: HitboxHistory = player.call("get_hitbox_history")
 		if not history:
 			continue
-		var shapes: Array = player.call("get_hitbox_shapes") if target_time < 0.0 else history.sample_at(target_time)
+		var shapes: Array
+		if cached_shapes.has(pid): shapes = cached_shapes[pid]
+		else: shapes = player.call("get_hitbox_shapes") if target_time < 0.0 else history.sample_at(target_time)
 		for shape in shapes:
 			var dist := _ray_capsule_hit_distance(origin, dir, shape["a"], shape["b"], shape["r"])
 			if dist >= 0.0 and dist < best_dist:
@@ -333,7 +373,30 @@ func report_hit(shooter_id: int, target_id: int, hit_bone: String, position: Vec
 	if order.x < previous.x or (order.x == previous.x and order.y <= previous.y):
 		return
 	_seen_reports[shooter_id] = order
-	print("[shot] player %d target %d (%s) at %s -> hp %d" % [shooter_id, target_id, hit_bone, position, hp_left])
+	_display_hit(shooter_id,target_id,hit_bone,position,hp_left,visual)
+
+func report_volley(shooter_id: int, payload: PackedByteArray) -> void:
+	var shot := ShotBatch.decode(payload)
+	if shot.is_empty(): return
+	var order := Vector2i(shot.shooter_life,shot.sequence)
+	var previous: Vector2i = _seen_reports.get(shooter_id,Vector2i(-1,-1))
+	if order.x<previous.x or (order.x==previous.x and order.y<=previous.y): return
+	_seen_reports[shooter_id]=order
+	var shooter := get_player(shooter_id)
+	if shooter and shooter_id != Fusion.get_local_player_id():
+		shooter.call("play_shot_effects",shot.sequence,shot.shooter_life,shot.profile,false)
+	for i in shot.hits.size():
+		var hit: Dictionary = shot.hits[i]
+		var visual := {"sequence":shot.sequence,"shooter_life":shot.shooter_life,"muzzle":shot.muzzle,"target_life":hit.target_life,"contact":hit.contact,"normal":hit.normal,"pellet":i}
+		_display_hit(shooter_id,hit.target_id,hit.hit_bone,hit.position,hit.hp_left,visual)
+
+func _pellet_key(shooter_id: int, life: int, sequence: int, pellet: int) -> String:
+	var key := ShotVisuals.shot_key(shooter_id,life,sequence)
+	return key if pellet==0 else key+":"+str(pellet)
+
+func _display_hit(shooter_id: int, target_id: int, hit_bone: String, position: Vector3, hp_left: int, visual: Dictionary) -> void:
+	if _posdump:
+		print("[shot] player %d target %d (%s) at %s -> hp %d" % [shooter_id, target_id, hit_bone, position, hp_left])
 	hit_reported.emit(shooter_id, target_id, hit_bone, position)
 
 	var display_position := position
@@ -349,7 +412,7 @@ func report_hit(shooter_id: int, target_id: int, hit_bone: String, position: Vec
 	elif target_id == -1 and hit_bone == HIT_WORLD:
 		spawn_impact(display_position, Color(0.85, 0.8, 0.6), normal)
 
-	var key := ShotVisuals.shot_key(shooter_id, visual["shooter_life"], visual["sequence"])
+	var key := _pellet_key(shooter_id, visual["shooter_life"], visual["sequence"],visual.get("pellet",0))
 	if shooter_id == Fusion.get_local_player_id():
 		# Correct a still-visible prediction in place; never flash a second line
 		# after a slow acknowledgement or modify a slot reused by another shot.
@@ -359,7 +422,9 @@ func report_hit(shooter_id: int, target_id: int, hit_bone: String, position: Vec
 			# An acknowledgement can beat the next physics tick on a fast link.
 			for pending in _predictions:
 				if pending["life"] == visual["shooter_life"] and pending["sequence"] == visual["sequence"]:
-					pending["confirmed_end"] = display_position
+					if not pending.has("confirmed_ends"): pending["confirmed_ends"]={}
+					pending["confirmed_ends"][visual.get("pellet",0)] = display_position
+					if visual.get("pellet",0)==0: pending["confirmed_end"] = display_position
 		else:
 			var tracer = predicted["node"].get_ref()
 			if is_instance_valid(tracer) and tracer.visible and tracer.get_meta("shot_key", "") == key:
@@ -390,7 +455,7 @@ func _poll_respawns() -> void:
 # tracer mesh + material + tween) on every peer for every shot.
 # ---------------------------------------------------------------------------
 
-const VFX_POOL_SIZE: int = 8
+const VFX_POOL_SIZE: int = 64
 const IMPACT_LIFETIME_SEC: float = 0.45
 const TRACER_FADE_SEC: float = 0.15
 

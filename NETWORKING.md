@@ -1,7 +1,7 @@
 # Network foundation
 
 The simulation uses Godot 4.7.2 and the repository's native Photon Fusion SDK.
-The wire version is `dgd-net-5`; peers with the old schema join a different
+The wire version is `dgd-net-6`; peers with the old schema join a different
 Photon application-version namespace and cannot accidentally mix packets.
 
 ## State and input
@@ -10,7 +10,7 @@ Photon application-version namespace and cannot accidentally mix packets.
   movement, view angles, flags, requested stance/equipment and life id.
 - `player/player.tscn` declares persistent replicated properties **before spawn**:
   HP, life id, respawn deadline, stance, weapon, aim, pitch and shot sequencing /
-  cooldown, the injury bit mask, and the selected weapon profile id. Fusion's `REPLICATION_AUTO` supplies transform and velocity.
+  cooldown, the injury bit mask, and the selected weapon profile id, and firing bloom/value timestamp. Fusion's `REPLICATION_AUTO` supplies transform and velocity.
 - The input owner predicts locally. The master executes the same decoded input.
   Queued input from a previous life is rejected after a respawn teleport.
 - Local mouse intent is independent of simulated angles: replay never overwrites
@@ -217,3 +217,22 @@ python3 tests/run_weapon.py /absolute/path/to/godot
 This checks six poses, stable paused IK, unreachable targets, length preservation,
 release/restore, final hitbox frames, editor drag/save/undo, profile replication,
 client authority rejection, and two-client torso/headshot effects and respawn.
+
+
+## Per-weapon firing
+
+The enabled `addons/dgd_firearm` main screen edits each weapon's nested `firing`
+resource. RPM, semi/auto mode, pellets, spread/aim/stance/bloom, damage/falloff,
+recoil and muzzle VFX are shared by the game and editor preview. The owner emits
+cosmetics immediately. The master reconstructs bounded deterministic pellet rays
+from its profile and current authoritative stance, movement and bloom. Bloom and
+its shared-clock timestamp replicate and survive authority migration. Cadence uses
+one shot of early arrival allowance (at most 100 ms), preserving cadence debt
+to absorb packet batching without sustained fire above the profile rate. Input does not catch up missed shots after a stall.
+
+`ShotBatch` carries one result message per trigger, at most 32 hit records, with
+life/sequence validation and per-pellet tracer keys. Histories are sampled once
+per volley before damage, so a lethal early pellet cannot erase later pellets'
+hit shapes. The single-hit codec is retained for existing visual tests. Recoil is
+local presentation outside prediction replay; the subsequent sent aim ray includes
+its visible camera offset. See `addons/dgd_firearm/README.md` for controls/limits.

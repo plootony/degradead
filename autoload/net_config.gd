@@ -62,7 +62,7 @@ const FIRE_INTERVAL_SEC: float = 0.1
 const OWNER_CORRECTION_DECAY_SEC: float = 0.05
 const MAX_CAMERA_ORIGIN_DISTANCE: float = 4.0
 # Bump when the input layout / replicated property schema changes.
-const NETWORK_VERSION: String = "dgd-net-5"
+const NETWORK_VERSION: String = "dgd-net-6"
 ## Set false to resolve against current positions (rewind = 0) -- the old 4a
 ## behaviour, useful to A/B how much the rewind changes hit feel.
 const LAG_COMPENSATION: bool = true
