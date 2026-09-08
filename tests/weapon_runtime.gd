@@ -13,6 +13,13 @@ func run():
 	scene.add_child(p)
 	p.set_process(false)
 	p.set_physics_process(false)
+	# Player no longer defaults to a weapon on its own (an empty
+	# _weapon_profile_id is now a legitimate "unarmed" state, granted only via
+	# Inventory -- see player.gd's _attach_weapon()) -- this test exercises the
+	# addon's IK directly, so seed the profile the way an equipped inventory
+	# slot would.
+	p._weapon_profile_id = "aks74"
+	p._apply_weapon_profile()
 	p._current_clip = "idle"
 	p._anim_player.play("idle")
 	for i in 60:
@@ -63,14 +70,16 @@ func run():
 		p._advance_visual_pose(1.0/60.0)
 		await process_frame
 	check(m._weight < 0.001,"reload_releases_hands")
-	p._weapon_slot = 1
-	p._apply_weapon_slot()
+	# Player itself no longer toggles DGDWeaponModifier.equipped (the modular
+	# inventory holsters an INACTIVE weapon slot on its own DGDWeaponMountVisual
+	# instead, see player.gd's _update_weapon_mounts()) -- exercise the
+	# addon's own holster capability directly.
+	m.equipped = false
 	for i in 5:
 		p._advance_visual_pose(1.0/60.0)
 		await process_frame
 	check(not m.equipped and m.weapon_root.transform.is_equal_approx(m.final_frames[m._back] * profile.transform_at(profile.holster_position,profile.holster_rotation)),"holstered_on_back")
-	p._weapon_slot = 0
-	p._apply_weapon_slot()
+	m.equipped = true
 	p._current_clip = "idle"
 	p._anim_player.play("idle")
 	for i in 60:

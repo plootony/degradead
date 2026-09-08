@@ -10,6 +10,9 @@ class_name Player
 
 signal hp_changed(hp: int)
 signal visual_pose_updated
+## Owner-only, local presentation: the inventory panel (ui/inventory_panel.gd)
+## listens to this to show/hide itself.
+signal inventory_visibility_changed(open: bool)
 
 const MOVE_SPEED: float = 4.5
 const GRAVITY: float = 9.8
@@ -58,8 +61,12 @@ enum View { THIRD_PERSON, FIRST_PERSON }
 const CAMERA_RIG = preload("res://addons/dgd_camera/rig.gd")
 var _camera_rig: DGDCameraRig
 
-enum WeaponSlot { RIFLE, HANDS }
-const WEAPON_SLOT_NAMES: Array[String] = ["AKS-74", "Hands"]
+## Widened from the old {RIFLE, HANDS} for the modular inventory (ТЗ §1):
+## three independently-equippable weapon slots plus bare hands. Index order
+## matches inventory/inventory.gd's DGDInventory.SlotKind (MAIN/SECONDARY/
+## PISTOL) for the first three values -- UNARMED has no inventory slot index.
+enum WeaponSlot { MAIN, SECONDARY, PISTOL, UNARMED }
+const WEAPON_SLOT_NAMES: Array[String] = ["Main", "Secondary", "Pistol", "Unarmed"]
 
 ## Stance system. Values double as STANCE_TRANSITION key digits below, so
 ## don't reorder without updating that table.
@@ -173,6 +180,12 @@ const HITBOX_BONES: Dictionary = {
 
 @export var model_scene: PackedScene = preload("res://player/model/tony.fbx")
 @export var weapon_library: DGDWeaponLibrary = preload("res://addons/dgd_weapon/library.tres")
+## Modular inventory (ТЗ §3/§5): item catalogue, respawn kit and weapon-mount
+## transforms are all data, editable without touching this script.
+@export var item_catalog: DGDItemCatalog = preload("res://inventory/item_catalog.tres")
+@export var starter_loadout: DGDStarterLoadout = preload("res://inventory/default_loadout.tres")
+@export var mount_config: DGDWeaponMountConfig = preload("res://inventory/mount_config.tres")
+const MOUNT_VISUAL = preload("res://addons/dgd_weapon/mount_visual.gd")
 const WEAPON_MODIFIER = preload("res://addons/dgd_weapon/modifier.gd")
 var _weapon_modifier: DGDWeaponModifier
 var _muzzle_effect: DGDMuzzleEffect
@@ -251,7 +264,7 @@ var _muzzle: Marker3D
 var _spring_arm: SpringArm3D
 var _view: View = View.THIRD_PERSON
 var _aiming: bool = false
-var _weapon_slot: int = WeaponSlot.RIFLE
+var _weapon_slot: int = WeaponSlot.MAIN
 var _current_clip: String = ""
 var _stance: int = Stance.STAND
 ## Last non-idle movement direction key ("forward"/"backward"/"left"/"right")
@@ -279,7 +292,7 @@ var _pitch: float = 0.0
 var _look_yaw: float = 0.0
 var _look_pitch: float = 0.0
 var _wanted_stance: int = Stance.STAND
-var _wanted_weapon: int = WeaponSlot.RIFLE
+var _wanted_weapon: int = WeaponSlot.MAIN
 var _jump_pending: bool = false
 var _fire_pending: bool = false
 var _shot_sequence: int = 0
@@ -304,8 +317,16 @@ var _last_input_motion := Vector3.ZERO
 var _view_snap_pending: bool = true
 
 
-var _ammo: DGDWeaponAmmo
+var _inventory: DGDPlayerInventory
 var _reload_visual_active := false
+## Three rigid mount points (MAIN/SECONDARY/PISTOL), indexed like WeaponSlot --
+## shows whichever weapon slot is NOT currently active (ТЗ §2). Built in
+## _build_model_and_skeleton(), refreshed every visual-pose tick.
+var _weapon_mounts: Array[DGDWeaponMountVisual] = []
+## Owner-only: Tab toggles this; while true, camera look/fire/weapon input is
+## ignored (ТЗ §4 "при открытом инвентаре блокировать стрельбу и управление
+## камерой") and the mouse cursor is released for the inventory UI.
+var _inventory_open: bool = false
 
 func _ready() -> void:
 	add_to_group("players")
@@ -339,8 +360,8 @@ func _ready() -> void:
 	_hitbox_history.setup(self)
 	add_child(_hitbox_history)
 
-	_ammo = get_node("WeaponAmmo")
-	_ammo.bind_player(self)
+	_inventory = get_node("Inventory")
+	_inventory.bind_player(self)
 	_refresh_registration()
 	_sync_presentation()
 
@@ -409,16 +430,30 @@ func _attach_weapon() -> void:
 	_weapon_modifier.name = "WeaponIK"
 	_skeleton.add_child(_weapon_modifier)
 	_weapon_modifier.modification_processed.connect(func(): visual_pose_updated.emit())
-	if _weapon_profile_id.is_empty():
-		_weapon_profile_id = weapon_library.default_id
+	# No default-profile fallback here (unlike the old single-weapon version):
+	# an empty _weapon_profile_id is now a legitimate "unarmed" state, granted
+	# by the inventory/starter kit rather than assumed. _apply_weapon_profile()
+	# below already handles a null profile (hides the in-hand model entirely).
 	_apply_weapon_profile()
+	_build_weapon_mounts()
+
+
+## Rigid mount points for the two weapon slots NOT currently in hand (ТЗ §2).
+## Children of the same Skeleton3D as WeaponRoot so their `transform` stays
+## skeleton-local, no manual world-space math needed (mirrors how
+## DGDWeaponModifier parents its own weapon_root).
+func _build_weapon_mounts() -> void:
+	_weapon_mounts.clear()
+	for i in WeaponSlot.UNARMED:  # MAIN, SECONDARY, PISTOL -- not UNARMED
+		var mount := MOUNT_VISUAL.new()
+		mount.name = "WeaponMount%d" % i
+		_skeleton.add_child(mount)
+		_weapon_mounts.append(mount)
 
 
 func _apply_weapon_profile() -> void:
 	if not _weapon_modifier: return
-	var profile := weapon_library.find_profile(_weapon_profile_id)
-	if not profile: profile = weapon_library.default_profile()
-	if not profile: return
+	var profile := weapon_library.find_profile(_weapon_profile_id) if not _weapon_profile_id.is_empty() else null
 	_weapon_modifier.profile = profile
 	_weapon_modifier.rebuild()
 	_weapon = _weapon_modifier.model
@@ -426,26 +461,24 @@ func _apply_weapon_profile() -> void:
 	_muzzle = _weapon_modifier.muzzle
 	_firearm_motion.reset()
 	_local_heat = 0.0
-	if not _muzzle_effect:
+	if profile and _muzzle and not _muzzle_effect:
 		_muzzle_effect = preload("res://addons/dgd_firearm/muzzle_effect.gd").new()
 		_muzzle.add_child(_muzzle_effect)
 	_observed_weapon_profile = _weapon_profile_id
-	_apply_weapon_slot()
 
 
+## Direct override, independent of the inventory (used by the weapon addon's
+## own tests/editor preview to force a profile without an equipped item). Real
+## gameplay never calls this -- _weapon_profile_id is otherwise only ever
+## derived from whatever the active weapon slot holds, see
+## _on_process_input()/broadcast_respawn()/rpc_request_move().
 func server_set_weapon_profile(id: String) -> bool:
 	if not Fusion.is_master_client() or not weapon_library.find_profile(id): return false
 	if id == _weapon_profile_id: return true
 	_weapon_profile_id = id
-	_ammo.select_profile()
 	_shot_heat = 0.0
 	_sync_presentation()
 	return true
-
-
-func _apply_weapon_slot() -> void:
-	if _weapon_modifier:
-		_weapon_modifier.equipped = _weapon_slot == WeaponSlot.RIFLE
 
 
 func _advance_visual_pose(delta: float) -> void:
@@ -456,6 +489,32 @@ func _advance_visual_pose(delta: float) -> void:
 		_weapon_modifier.allow_ik = _hp > 0 and _current_clip not in ["reload", "melee", "rifle_pull_out", "rifle_put_away"]
 	if _anim_player: _anim_player.advance(delta)
 	if _skeleton: _skeleton.advance(delta)
+	_update_weapon_mounts()  # after skeleton.advance() so bone poses are this tick's
+
+
+## Shows each inactive weapon slot's item on its configured mount point (ТЗ
+## §2). Deterministic from replicated state (_weapon_slot, Inventory.slots_json)
+## alone, so every peer -- including observers of another player -- renders
+## the same result; the active slot is excluded so a weapon is never drawn
+## both in-hand and on its mount at once.
+func _update_weapon_mounts() -> void:
+	if not _skeleton or not _inventory or _weapon_mounts.size() < WeaponSlot.UNARMED:
+		return
+	for slot in WeaponSlot.UNARMED:
+		var mount := _weapon_mounts[slot]
+		if slot == _weapon_slot or _dead:
+			mount.visible = false
+			continue
+		var profile_id := _inventory.weapon_profile_id_at(slot)
+		if profile_id.is_empty():
+			mount.visible = false
+			continue
+		var profile := weapon_library.find_profile(profile_id)
+		mount.show_profile(profile)
+		if profile:
+			var bone_idx := _skeleton.find_bone(mount_config.bone_for(slot))
+			if bone_idx != -1:
+				mount.apply_transform(_visual_bone_frame(bone_idx), mount_config.position_for(slot), mount_config.rotation_for(slot))
 
 
 func _build_camera_rig() -> void:
@@ -728,13 +787,21 @@ static func _find_child_of_type(root: Node, type) -> Node:
 func _unhandled_input(event: InputEvent) -> void:
 	if not _has_input_authority() or not Fusion.is_in_room():
 		return
+	if event.is_action_pressed("toggle_inventory"):
+		_toggle_inventory()
+		return
 	if event.is_action_released("fire"):
 		_auto_trigger = false
 	if event.is_action_pressed("ui_cancel"):
 		_auto_trigger = false
-		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+		if _inventory_open:
+			_toggle_inventory()
+		else:
+			Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 		_jump_pending = false
 		return
+	if _inventory_open:
+		return  # ТЗ §4: открытый инвентарь блокирует стрельбу и камеру
 	if event is InputEventMouseButton and event.pressed and Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 		return  # The capture click is not a shot.
@@ -756,15 +823,31 @@ func _unhandled_input(event: InputEvent) -> void:
 	elif event.is_action_pressed("switch_weapon"):
 		_request_weapon_slot((_wanted_weapon + 1) % WeaponSlot.size())
 	elif event.is_action_pressed("weapon_slot_1"):
-		_request_weapon_slot(WeaponSlot.RIFLE)
+		_request_weapon_slot(WeaponSlot.MAIN)
 	elif event.is_action_pressed("weapon_slot_2"):
-		_request_weapon_slot(WeaponSlot.HANDS)
+		_request_weapon_slot(WeaponSlot.SECONDARY)
+	elif event.is_action_pressed("weapon_slot_3"):
+		_request_weapon_slot(WeaponSlot.PISTOL)
+	elif event.is_action_pressed("unequip"):
+		_request_weapon_slot(WeaponSlot.UNARMED)
 	elif event.is_action_pressed("crouch"):
 		_request_stance(Stance.STAND if _wanted_stance == Stance.CROUCH else Stance.CROUCH)
 	elif event.is_action_pressed("prone"):
 		_request_stance(Stance.STAND if _wanted_stance == Stance.PRONE else Stance.PRONE)
 	elif event.is_action_pressed("melee"):
 		_request_melee()
+
+
+## Owner-only local presentation state -- not replicated, not part of
+## simulation (ТЗ §5 keeps inventory UI separate from the network transport).
+## Releases/recaptures the mouse the same way ui_cancel / a capture-click
+## already do elsewhere in this function.
+func _toggle_inventory() -> void:
+	_inventory_open = not _inventory_open
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if _inventory_open else Input.MOUSE_MODE_CAPTURED
+	if _inventory_open:
+		_auto_trigger = false
+	inventory_visibility_changed.emit(_inventory_open)
 
 
 func set_view(view: View) -> void:
@@ -784,7 +867,10 @@ func set_aiming(aiming: bool) -> void:
 func _request_weapon_slot(slot: int) -> void:
 	if _hp > 0 and slot >= 0 and slot < WeaponSlot.size():
 		_wanted_weapon = slot
-		if slot != WeaponSlot.RIFLE and _ammo: _ammo.cancel_prediction()
+		# Switching away from whatever slot is mid-reload cancels the local
+		# prediction of it (generalizes the old "leaving the rifle slot" rule
+		# to all three weapon slots).
+		if slot != _weapon_slot and _inventory: _inventory.cancel_prediction()
 
 
 func _request_stance(new_stance: int) -> void:
@@ -811,14 +897,14 @@ func _can_take_stance(new_stance: int) -> bool:
 
 ## Visual only -- no melee hit detection/damage yet, see REVIEW_NOTES.md.
 func _request_melee() -> void:
-	if _dead or _weapon_slot != WeaponSlot.RIFLE:
+	if _dead or not DGDInventory.is_weapon_slot(_weapon_slot):
 		return
 	Fusion.rpc(rpc_play_melee)
 
 
 @rpc("any_peer", "call_local")
 func rpc_play_melee() -> void:
-	if not _rpc_from_owner_alive() or _weapon_slot != WeaponSlot.RIFLE:
+	if not _rpc_from_owner_alive() or not DGDInventory.is_weapon_slot(_weapon_slot):
 		return
 	_play_action("melee")
 
@@ -876,8 +962,9 @@ const STANCE_STATUS_SUFFIX: Dictionary = {Stance.CROUCH: "   CROUCH [C]", Stance
 
 func _emit_local_status() -> void:
 	if MatchServer and _has_input_authority():
-		MatchServer.local_status_changed.emit("%s [Q]   %s [V]%s%s" % [
-			_weapon_modifier.profile.title if _weapon_slot == WeaponSlot.RIFLE and _weapon_modifier and _weapon_modifier.profile else WEAPON_SLOT_NAMES[_weapon_slot],
+		var armed_title := _weapon_modifier.profile.title if DGDInventory.is_weapon_slot(_weapon_slot) and _weapon_modifier and _weapon_modifier.profile and not _weapon_profile_id.is_empty() else ""
+		MatchServer.local_status_changed.emit("%s [Q]   %s [V]%s%s   [Tab] Inv" % [
+			armed_title if not armed_title.is_empty() else WEAPON_SLOT_NAMES[_weapon_slot],
 			"1st person" if _view == View.FIRST_PERSON else "3rd person",
 			"   AIM" if _aiming else "",
 			STANCE_STATUS_SUFFIX.get(_stance, ""),
@@ -897,6 +984,7 @@ func _physics_process(delta: float) -> void:
 			_status_emitted = true
 			_emit_hp()
 			_emit_local_status()
+			MatchServer.local_player_ready.emit(self)
 		var captured := Input.mouse_mode == Input.MOUSE_MODE_CAPTURED
 		var move_input := Input.get_vector("move_left", "move_right", "move_forward", "move_back") if captured else Vector2.ZERO
 		if _automove:
@@ -1006,17 +1094,16 @@ func _sync_presentation() -> void:
 		_emit_local_status()
 	if _observed_weapon != _weapon_slot:
 		if _observed_weapon >= 0 and not _dead:
-			_play_action("rifle_pull_out" if _weapon_slot == WeaponSlot.RIFLE else "rifle_put_away")
+			_play_action("rifle_pull_out" if DGDInventory.is_weapon_slot(_weapon_slot) else "rifle_put_away")
 		_observed_weapon = _weapon_slot
-		_apply_weapon_slot()
 		_emit_local_status()
 
 	if _observed_aim != _aiming:
 		_observed_aim = _aiming
 		_emit_local_status()
 
-	if _ammo:
-		_ammo.sync_view()
+	if _inventory:
+		_inventory.sync_view()
 		_sync_reload_animation()
 
 
@@ -1027,14 +1114,14 @@ func get_firing_settings() -> DGDFirearmSettings:
 	return p.firing
 
 func _update_automatic_fire(trigger_held: bool, captured: bool) -> void:
-	if _auto_trigger and trigger_held and captured and get_firing_settings().fire_mode == 1:
+	if _auto_trigger and trigger_held and captured and not _inventory_open and get_firing_settings().fire_mode == 1:
 		_try_fire()
 
 func _try_fire() -> void:
 	var now := Time.get_ticks_msec() / 1000.0
-	if not _camera or _hp <= 0 or _wanted_weapon != WeaponSlot.RIFLE or _weapon_slot != WeaponSlot.RIFLE or now < _local_next_fire_at or _current_clip in ["reload","rifle_pull_out","rifle_put_away","melee"]:
+	if not _camera or _hp <= 0 or _inventory_open or _wanted_weapon != _weapon_slot or not DGDInventory.is_weapon_slot(_weapon_slot) or now < _local_next_fire_at or _current_clip in ["reload","rifle_pull_out","rifle_put_away","melee"]:
 		return
-	if not _ammo or _ammo.is_reloading() or _ammo.predicted_magazine() <= 0: return
+	if not _inventory or _inventory.is_reloading() or _inventory.predicted_magazine() <= 0: return
 	var p := get_firing_settings()
 	# Preserve cadence across frame rounding; skip backlog after a long stall.
 	_local_next_fire_at = now+p.interval() if now-_local_next_fire_at>p.interval() else _local_next_fire_at+p.interval()
@@ -1047,7 +1134,7 @@ func _try_fire() -> void:
 	var seed_value := DGDBallistics.shot_seed(get_player_id(),_life_id,_shot_sequence)
 	var rays := DGDBallistics.directions(-_camera.global_basis.z,angle,p.pellet_count(),seed_value)
 	MatchServer.predict_shot(self, _shot_sequence, _life_id, _camera.global_position, -_camera.global_basis.z, get_muzzle_position(),rays,p.value("max_range"))
-	_ammo.predict_shot(_shot_sequence)
+	_inventory.predict_shot(_shot_sequence)
 	_send_fire_request()
 	_local_heat = minf(p.value("bloom_max"),_local_heat+p.value("bloom_per_shot"))
 	_local_heat_at = now
@@ -1108,7 +1195,7 @@ func _update_animation(delta: float) -> void:
 	if _leg_tuck_modifier:
 		_leg_tuck_modifier.tuck = _leg_tuck_amount
 
-	if _ammo and _ammo.is_reloading():
+	if _inventory and _inventory.is_reloading():
 		_sync_reload_animation()
 		return
 
@@ -1200,8 +1287,17 @@ func _on_process_input(_tick: int, delta_time: float, payload: PackedByteArray, 
 	if _hp > 0:
 		if _can_take_stance(input["stance"]):
 			_stance = input["stance"]
+		var previous_weapon_slot := _weapon_slot
 		_weapon_slot = input["weapon"]
 		_aiming = flags & INPUT_FLAG_AIM != 0
+		# Runs identically during owner prediction and master execution, same
+		# as _stance/_weapon_slot themselves -- Fusion's replication of
+		# _weapon_profile_id reconciles the two exactly like every other
+		# predicted field here. Edge-triggered (not every tick) so a manually
+		# forced profile (server_set_weapon_profile(), used by weapon addon
+		# tests) isn't stomped while the slot itself hasn't changed.
+		if _weapon_slot != previous_weapon_slot and _inventory:
+			_weapon_profile_id = _inventory.weapon_profile_id_at(_weapon_slot) if DGDInventory.is_weapon_slot(_weapon_slot) else ""
 	_apply_stance_collision()  # also restores collider size during rollback
 	var before_move := global_position
 	_apply_movement(Vector2.ZERO if _hp <= 0 else input["move"], delta_time,
@@ -1272,8 +1368,8 @@ func rpc_request_fire(sequence: int, life_id: int, origin: Vector3, direction: V
 	if sequence <= _last_shot_sequence or sequence > 0x7fffffff or not origin.is_finite() or not muzzle.is_finite() or not direction.is_finite() or not is_finite(shooter_rtt):
 		return
 	var now := float(Fusion.get_network_time())
-	if not _ammo.receive_shot(sequence, now): return
-	if _hp <= 0 or _weapon_slot != WeaponSlot.RIFLE: return
+	if not _inventory.receive_shot(sequence, now): return
+	if _hp <= 0 or not DGDInventory.is_weapon_slot(_weapon_slot): return
 	var p := get_firing_settings()
 	# Allow one batched arrival (at most 100 ms), retaining cadence debt.
 	if now + minf(p.interval(),0.1) < _next_fire_at or direction.length_squared() < 0.9 or direction.length_squared() > 1.1:
@@ -1288,7 +1384,7 @@ func rpc_request_fire(sequence: int, life_id: int, origin: Vector3, direction: V
 	var rays := DGDBallistics.directions(direction,angle,p.pellet_count(),DGDBallistics.shot_seed(get_player_id(),life_id,sequence))
 	_shot_heat = minf(p.value("bloom_max"),_shot_heat+p.value("bloom_per_shot"))
 	_shot_heat_at = now
-	_ammo.consume_shot()
+	_inventory.consume_shot()
 	MatchServer.queue_shot(self, origin, direction.normalized(), shooter_rtt, life_id, sequence, muzzle,rays,p,_weapon_profile_id)
 
 
@@ -1312,7 +1408,7 @@ func server_apply_damage(damage: int, hitbox_key: String = "body") -> int:
 	# A head hit is lethal independently of the weapon damage or current HP.
 	_hp = 0 if hitbox_key == "head" else maxi(0, _hp - damage)
 	if _hp == 0:
-		_ammo.reload_until = 0.0
+		_inventory.reload_until = 0.0
 		_respawn_at = float(Fusion.get_network_time()) + NetConfig.RESPAWN_DELAY_SEC
 	return _hp
 
@@ -1321,7 +1417,11 @@ func broadcast_respawn(spawn_pos: Vector3) -> void:
 	if not Fusion.is_master_client():
 		return
 	_life_id += 1
-	_ammo.reset_life()
+	_inventory.grant_starter_kit()
+	# The active slot index may be unchanged from before death, but its
+	# contents just got reset by the starter kit -- always recompute (ТЗ §5:
+	# "на возрождении выдавать настраиваемый стартовый комплект").
+	_weapon_profile_id = _inventory.weapon_profile_id_at(_weapon_slot) if DGDInventory.is_weapon_slot(_weapon_slot) else ""
 	_shot_heat = 0.0
 	_shot_heat_at = 0.0
 	_hp = NetConfig.MAX_HP
@@ -1421,11 +1521,11 @@ func get_hitbox_history() -> HitboxHistory:
 
 
 func _request_reload() -> void:
-	if not _has_input_authority() or not Fusion.is_in_room() or _hp <= 0 or not _ammo: return
-	if _weapon_slot != WeaponSlot.RIFLE or _wanted_weapon != WeaponSlot.RIFLE: return
-	if _ammo.is_reloading() or _ammo.reserve <= 0 or _ammo.predicted_magazine() >= int(get_firing_settings().value("magazine_size")): return
+	if not _has_input_authority() or not Fusion.is_in_room() or _hp <= 0 or not _inventory or _inventory_open: return
+	if not DGDInventory.is_weapon_slot(_weapon_slot) or _wanted_weapon != _weapon_slot: return
+	if _inventory.is_reloading() or _inventory.reserve_for_active() <= 0 or _inventory.predicted_magazine() >= int(get_firing_settings().value("magazine_size")): return
 	if _current_clip in ["rifle_pull_out","rifle_put_away","melee"]: return
-	var nonce := _ammo.predict_reload()
+	var nonce := _inventory.predict_reload()
 	_sync_reload_animation()
 	Fusion.rpc_to(NetConfig.RPC_TARGET_MASTER, rpc_request_reload, nonce, _life_id, _weapon_profile_id)
 
@@ -1434,27 +1534,27 @@ func _request_reload() -> void:
 func rpc_request_reload(nonce: int, life: int, profile: String) -> void:
 	if not Fusion.is_master_client() or not _rpc_sender_is(get_player_id()): return
 	if life != _life_id or profile != _weapon_profile_id or nonce <= 0 or nonce > 0x7fffffff: return
-	_ammo.start_reload(float(Fusion.get_network_time()), nonce)
+	_inventory.start_reload(float(Fusion.get_network_time()), nonce)
 	# Duplicate requests report the existing deadline without restarting it.
-	Fusion.rpc(Callable(self,"rpc_reload_result"), nonce, life, _ammo.reload_until)
+	Fusion.rpc(Callable(self,"rpc_reload_result"), nonce, life, _inventory.reload_until)
 
 
 @rpc("any_peer", "call_local", "reliable")
 func rpc_reload_result(nonce: int, life: int, deadline: float) -> void:
 	if not _rpc_from_master() or not _has_input_authority() or life != _life_id: return
-	_ammo.reload_result(nonce,deadline)
+	_inventory.reload_result(nonce,deadline)
 	_sync_reload_animation()
 
 
 func _sync_reload_animation() -> void:
 	if not _anim_player: return
-	if _ammo.is_reloading():
+	if _inventory.is_reloading():
 		if _current_clip != "reload" or not _reload_visual_active:
 			var clip := _anim_player.get_animation("reload")
 			if clip:
 				var duration := get_firing_settings().value("reload_time")
 				_play_action("reload",clip.length/duration)
-				_anim_player.seek(clampf(1.0-(_ammo.reload_deadline()-float(Fusion.get_network_time()))/duration,0.0,1.0)*clip.length,true)
+				_anim_player.seek(clampf(1.0-(_inventory.reload_deadline()-float(Fusion.get_network_time()))/duration,0.0,1.0)*clip.length,true)
 		_reload_visual_active = true
 	elif _reload_visual_active:
 		_reload_visual_active = false
@@ -1464,4 +1564,25 @@ func _sync_reload_animation() -> void:
 
 
 func server_tick_ammo(now: float) -> void:
-	if _ammo: _ammo.server_tick(now)
+	if _inventory: _inventory.server_tick(now)
+
+
+## Inventory move (drag & drop), UI-facing entry point (ТЗ §4/§5): the owner
+## sends a request, the master is the only one who mutates the inventory, and
+## the moved item only visibly relocates once slots_json replicates back --
+## see net/player_inventory.gd's request_move()/server_move() docs.
+func request_move_item(from: int, to: int) -> void:
+	if not _has_input_authority() or not Fusion.is_in_room() or not _inventory: return
+	var nonce := _inventory.request_move()
+	Fusion.rpc_to(NetConfig.RPC_TARGET_MASTER, rpc_request_move, nonce, from, to)
+
+
+@rpc("any_peer", "reliable")
+func rpc_request_move(nonce: int, from: int, to: int) -> void:
+	if not Fusion.is_master_client() or not _rpc_sender_is(get_player_id()): return
+	if _inventory.server_move(nonce, from, to) and DGDInventory.is_weapon_slot(_weapon_slot):
+		_weapon_profile_id = _inventory.weapon_profile_id_at(_weapon_slot)
+
+
+func get_inventory() -> DGDPlayerInventory:
+	return _inventory

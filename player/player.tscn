@@ -2,10 +2,10 @@
 
 [ext_resource type="Script" path="res://player/player.gd" id="1"]
 
-[ext_resource type="Script" path="res://net/weapon_ammo.gd" id="2_ammo"]
+[ext_resource type="Script" path="res://net/player_inventory.gd" id="2_inventory"]
 
 [sub_resource type="FusionReplicationConfig" id="ReplicationState"]
-property_count = 20
+property_count = 18
 properties/0/path = NodePath(":_hp")
 properties/1/path = NodePath(":_life_id")
 properties/2/path = NodePath(":_respawn_at")
@@ -20,13 +20,11 @@ properties/10/path = NodePath(":_weapon_profile_id")
 properties/11/path = NodePath(":_shot_heat")
 properties/12/path = NodePath(":_shot_heat_at")
 
-properties/13/path = NodePath("WeaponAmmo:magazine")
-properties/14/path = NodePath("WeaponAmmo:reserve")
-properties/15/path = NodePath("WeaponAmmo:reload_until")
-properties/16/path = NodePath("WeaponAmmo:active_profile")
-properties/17/path = NodePath("WeaponAmmo:archive")
-properties/18/path = NodePath("WeaponAmmo:processed_shot")
-properties/19/path = NodePath("WeaponAmmo:reload_nonce")
+properties/13/path = NodePath("Inventory:slots_json")
+properties/14/path = NodePath("Inventory:reload_until")
+properties/15/path = NodePath("Inventory:processed_shot")
+properties/16/path = NodePath("Inventory:reload_nonce")
+properties/17/path = NodePath("Inventory:move_nonce")
 
 [node name="Player" type="CharacterBody3D"]
 script = ExtResource("1")
@@ -40,5 +38,5 @@ root_interpolation_mode = 1
 root_teleport_threshold = 2.5
 root_snap_distance = 2.5
 
-[node name="WeaponAmmo" type="Node" parent="."]
-script = ExtResource("2_ammo")
+[node name="Inventory" type="Node" parent="."]
+script = ExtResource("2_inventory")

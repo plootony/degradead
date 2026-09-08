@@ -16,6 +16,10 @@ signal local_ammo_changed(state: Dictionary)
 signal local_injuries_changed(parts: int, hp: int)
 ## Local player's weapon / view / aim summary line for the HUD.
 signal local_status_changed(text: String)
+## Fired once, the first physics tick the local Player confirms input
+## authority -- lets the inventory UI (built before any player exists) grab a
+## reference to call into (ui/inventory_panel.gd).
+signal local_player_ready(player: Node)
 
 ## Sentinel hit_bone value for a shot that stopped on level geometry.
 const HIT_WORLD: String = "world"

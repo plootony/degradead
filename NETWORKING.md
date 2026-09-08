@@ -9,8 +9,13 @@ Photon application-version namespace and cannot accidentally mix packets.
 - `net/player_input.gd` is the pure 12-byte input codec. Each tick includes
   movement, view angles, flags, requested stance/equipment and life id.
 - `player/player.tscn` declares persistent replicated properties **before spawn**:
-  HP, life id, respawn deadline, stance, weapon, aim, pitch and shot sequencing /
-  cooldown, the injury bit mask, and the selected weapon profile id, and firing bloom/value timestamp. The static `WeaponAmmo` child also declares magazine, reserve, reload deadline, active profile, stowed inventory, processed-shot watermark and reload nonce. Fusion's `REPLICATION_AUTO` supplies transform and velocity.
+  HP, life id, respawn deadline, stance, weapon slot, aim, pitch and shot
+  sequencing / cooldown, the injury bit mask, and the selected weapon profile
+  id, and firing bloom/value timestamp. The static `Inventory` child (see
+  "Modular inventory" below) declares one JSON snapshot of every slot (item,
+  stack count, per-instance magazine), the reload deadline, and two request
+  watermarks (reload nonce, item-move nonce). Fusion's `REPLICATION_AUTO`
+  supplies transform and velocity.
 - The input owner predicts locally. The master executes the same decoded input.
   Queued input from a previous life is rejected after a respawn teleport.
 - Local mouse intent is independent of simulated angles: replay never overwrites
@@ -194,9 +199,14 @@ parameters, editor workflow and its runtime/editor/network tests.
 `addons/dgd_weapon` adds a main editor screen named **Оружие IK**. Each weapon
 profile contains a model, two grip transforms, elbow offsets, muzzle and holster
 transforms, and six stance/aim adjustments. See its README for the workflow.
-`server_set_weapon_profile(id)` validates the catalogue id on the master;
-`_weapon_profile_id` is durable snapshot state. All peers must ship the same
-catalogue. Bone rotations are computed locally and are not sent over the wire.
+`_weapon_profile_id` is durable snapshot state, but is no longer set directly
+in normal play: the master derives it from whatever item occupies the active
+weapon slot in the inventory (see "Modular inventory" below) every time that
+slot changes. `server_set_weapon_profile(id)` still validates a catalogue id
+and force-sets it directly, bypassing the inventory entirely -- kept only for
+the weapon addon's own tests/editor preview, which need a profile active
+without an equipped item. All peers must ship the same weapon catalogue. Bone
+rotations are computed locally and are not sent over the wire.
 
 The AnimationPlayer and Skeleton3D advance manually once per visual physics
 update. Spine/jump modifiers run before the final weapon modifier. The weapon
@@ -238,23 +248,73 @@ local presentation outside prediction replay; the subsequent sent aim ray includ
 its visible camera offset. See `addons/dgd_firearm/README.md` for controls/limits.
 
 
-## Ammunition and reload
+## Modular inventory
 
-`net/weapon_ammo.gd` owns ammunition state separately from movement simulation.
-The host consumes one cartridge per accepted volley, validates reload eligibility,
-and completes the transfer at the shared-clock deadline outside input replay.
-Every otherwise valid shot sequence is acknowledged even when ammo, reload or
-cadence rejects it, allowing the owner to reconcile its immediate HUD decrement.
-Reload requests carry an increasing nonce, life and profile; duplicates do not
-restart the deadline. Only master-authenticated results affect local prediction.
-Death, holstering and profile changes cancel reload without spending reserve.
-Respawn resets the inventory. Stowed magazines and caliber pools are archived
-only on weapon changes; active shots replicate small scalar changes. Both the
-archive and timer survive late join and authority migration.
+`inventory/inventory.gd` (`DGDInventory`, a plain `RefCounted`) is pure data +
+rules: nine slots (main/secondary/pistol weapon slots, six universal cells),
+each holding `{item, count, magazine}`. It has no Node, no signals, no
+networking -- `net/player_inventory.gd` (`DGDPlayerInventory`, the `Inventory`
+child in player.tscn) is the only thing that owns a live instance, mutates it,
+and mirrors it into the replicated `slots_json` string. Items themselves are
+data too: `inventory/item_def.gd` describes id/title/icon/type/allowed slots/
+max stack, resolved from a shared `DGDItemCatalog` (`item_catalog.tres`, same
+"every peer ships the same catalogue" contract as the weapon library). The UI
+(`ui/inventory_panel.gd`) never touches either directly -- it only calls
+`Player.request_move_item()`/reads `Player.get_inventory()`'s accessors.
+
+**Magazine vs. reserve.** A weapon's magazine is stored on its own inventory
+slot (`slot.magazine`), so two instances of the same weapon profile in
+different slots never share a magazine. Loose ammunition is inventory-wide:
+an ammo-box item's `count` is its remaining rounds, and `total_ammo(caliber)`
+sums every box matching a weapon's `DGDFirearmSettings.ammo_key()` regardless
+of which of the six universal cells it sits in. A reload draws
+`min(capacity - magazine, total_ammo(caliber))` from those boxes in slot
+order, depleting (and removing) them one at a time.
+
+**Authority.** The host is the only one who ever mutates the inventory --
+item moves (`rpc_request_move`) and reload start/consume (`rpc_request_reload`
+/ shot volleys) are all master-validated RPCs, exactly like the pre-existing
+shot/reload flow. Two monotonic watermarks (`move_nonce`, `reload_nonce`,
+alongside the pre-existing shot-sequence watermark) reject replayed or
+rapid-duplicate requests: a bumped watermark makes a retry a guaranteed no-op
+even if it arrives twice. Item moves are deliberately **not** predicted --
+the moved item only visibly relocates once `slots_json` replicates back, which
+removes an entire class of "duplicate under rapid drag" bugs by construction
+instead of requiring client-side reconciliation (the inventory UI already
+blocks combat while open, so the added latency is unnoticeable). Reload keeps
+the pre-existing predict/confirm dance. Switching which weapon slot is active
+cancels an in-flight reload for the slot being left, same as death.
+
+**Equip/weapon slots.** Which of the three weapon slots (or none, "unarmed")
+is active still rides the versioned input packet exactly like stance did
+before it (`net/player_input.gd`'s weapon field widened from 1 to 2 bits,
+`dgd-net-8`) -- no new RPC. `_weapon_profile_id` (already durable snapshot
+state) is derived by the master from whichever item occupies the newly-active
+slot every time it changes, so the existing `DGDWeaponModifier` IK/firing
+pipeline needs no changes at all: it still only ever sees one profile id. The
+two weapon slots that are NOT active render on their own rigid
+`DGDWeaponMountVisual` (`addons/dgd_weapon/mount_visual.gd`, configured per
+slot by `inventory/mount_config.gd`) instead of in-hand IK, so a weapon is
+never drawn both in the hand and on a mount at once; this is computed
+identically on every peer from already-replicated state, so it renders
+correctly for observers of another player too.
+
+**Starter kit.** `broadcast_respawn()` calls
+`Inventory.apply_loadout(catalog, weapon_library, starter_loadout)`
+(`inventory/loadout.gd`, a plain `.tres` list of `{slot, item_id, count}`)
+instead of the old single-weapon `reset_life()`. The very first spawn (which
+never goes through `broadcast_respawn()`) grants the same kit lazily the
+first time `Inventory.bind_player()` runs on the master, mirroring the old
+"still at its never-initialized sentinel" trick.
+
+**Late join / migration.** `slots_json`/`reload_until`/the two nonces are
+ordinary snapshot-replicated properties (same mechanism as `_hp`/`_life_id`),
+so a late joiner or a newly-promoted master needs no extra code to see the
+exact same inventory a departing master had.
 
 Regression commands:
 
 ```sh
-python3 tests/run_ammo.py /absolute/path/to/godot
-python3 tests/run_ammo.py /absolute/path/to/godot ammo_migration_peer
+python3 tests/run_inventory.py /absolute/path/to/godot
+python3 tests/run_inventory.py /absolute/path/to/godot inventory_migration_peer
 ```

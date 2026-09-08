@@ -23,7 +23,7 @@ static func decode(buf: PackedByteArray) -> Dictionary:
 		return {}
 	var stance := buf.decode_u8(7) & 3
 	var weapon := buf.decode_u8(7) >> 2
-	if stance >= 3 or weapon >= 2 or buf.decode_u8(6) & 0xf0 != 0:
+	if stance >= 3 or weapon >= 4 or buf.decode_u8(6) & 0xf0 != 0:
 		return {}
 	return {
 		"move": Vector2(buf.decode_s8(0) / 127.0, buf.decode_s8(1) / 127.0).limit_length(),

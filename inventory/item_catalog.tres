@@ -1,0 +1,26 @@
+[gd_resource type="Resource" script_class="DGDItemCatalog" load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://inventory/item_catalog.gd" id="1"]
+[ext_resource type="Script" path="res://inventory/item_def.gd" id="2"]
+
+[sub_resource type="Resource" id="Item_aks74"]
+script = ExtResource("2")
+id = "aks74"
+title = "АКС-74"
+type = 0
+weapon_profile_id = "aks74"
+allowed_slots = Array[int]([0, 1])
+max_stack = 1
+
+[sub_resource type="Resource" id="Item_ammo_545x39"]
+script = ExtResource("2")
+id = "ammo_545x39"
+title = "Патроны 5.45×39"
+type = 1
+ammo_caliber = "5.45×39"
+allowed_slots = Array[int]([3])
+max_stack = 90
+
+[resource]
+script = ExtResource("1")
+items = Array[ExtResource("2")]([SubResource("Item_aks74"), SubResource("Item_ammo_545x39")])

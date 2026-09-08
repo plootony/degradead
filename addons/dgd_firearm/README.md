@@ -95,7 +95,7 @@
 
 ```sh
 python3 tests/run_firearm.py /absolute/path/to/godot --network
-python3 tests/run_ammo.py /absolute/path/to/godot
+python3 tests/run_inventory.py /absolute/path/to/godot
 python3 tests/run_network.py /absolute/path/to/godot
 ```
 

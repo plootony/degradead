@@ -1,0 +1,15 @@
+[gd_resource type="Resource" script_class="DGDStarterLoadout" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://inventory/loadout.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+entries = Array[Dictionary]([{
+"count": 1,
+"item_id": "aks74",
+"slot": 0
+}, {
+"count": 90,
+"item_id": "ammo_545x39",
+"slot": 3
+}])

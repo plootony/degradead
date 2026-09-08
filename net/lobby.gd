@@ -21,6 +21,7 @@ var _room_input: LineEdit
 var _hud: Control
 var _injury_panel: Control
 var _combat_panel: VBoxContainer
+var _inventory_panel: Control
 var _hp_label: Label
 var _weapon_label: Label
 var _stats_label: Label
@@ -251,6 +252,11 @@ func _build_ui() -> void:
 	_hp_label = _combat_panel.hp_label
 	MatchServer.local_ammo_changed.connect(_combat_panel.set_ammo)
 
+	_inventory_panel = preload("res://ui/inventory_panel.gd").new()
+	_inventory_panel.mouse_filter = Control.MOUSE_FILTER_STOP
+	_hud.add_child(_inventory_panel)
+	MatchServer.local_player_ready.connect(_inventory_panel.set_player)
+
 	_weapon_label = Label.new()
 	_weapon_label.position = Vector2(132, 44)
 	_weapon_label.add_theme_font_size_override("font_size", 16)
@@ -298,6 +304,8 @@ func _exit_tree() -> void:
 		MatchServer.local_ammo_changed.disconnect(_combat_panel.set_ammo)
 	if is_instance_valid(_injury_panel) and MatchServer.local_injuries_changed.is_connected(_injury_panel.set_injuries):
 		MatchServer.local_injuries_changed.disconnect(_injury_panel.set_injuries)
+	if is_instance_valid(_inventory_panel) and MatchServer.local_player_ready.is_connected(_inventory_panel.set_player):
+		MatchServer.local_player_ready.disconnect(_inventory_panel.set_player)
 	if MatchServer.local_status_changed.is_connected(_on_local_status_changed):
 		MatchServer.local_status_changed.disconnect(_on_local_status_changed)
 	if MatchServer.local_hp_changed.is_connected(_on_local_hp_changed):
@@ -438,4 +446,6 @@ func _on_room_left() -> void:
 	_join_panel.visible = true
 	_hud.visible = false
 	_injury_panel.set_injuries(0, NetConfig.MAX_HP)
+	_inventory_panel.player = null
+	_inventory_panel.visible = false
 	_status_label.text = "Left room"
